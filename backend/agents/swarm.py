@@ -4,21 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from backend.agents.solver import Solver
-from backend.checkpoints import (
-    build_resume_context,
-    refresh_checkpoint_from_latest_trace,
-    save_solver_checkpoint,
-    solver_checkpoint_path,
-    solver_workspace_path,
-)
 from backend.cost_tracker import CostTracker
 from backend.message_bus import ChallengeMessageBus
-from backend.models import DEFAULT_MODELS, model_id_from_spec, provider_from_spec
+from backend.models import DEFAULT_MODELS
 from backend.platforms import CompetitionPlatform
 from backend.prompts import ChallengeMeta
 from backend.solver_base import (
@@ -26,7 +20,6 @@ from backend.solver_base import (
     ERROR,
     FLAG_FOUND,
     GAVE_UP,
-    QUOTA_ERROR,
     SolverProtocol,
     SolverResult,
 )
@@ -35,19 +28,6 @@ if TYPE_CHECKING:
     from backend.config import Settings
 
 logger = logging.getLogger(__name__)
-
-
-# Quota fallback: map subscription-backed providers to API-backed equivalents
-QUOTA_FALLBACK: dict[str, str] = {
-    "claude-sdk/claude-opus-4-6": "bedrock/us.anthropic.claude-opus-4-6-v1",
-    "codex/gpt-5.4": "azure/gpt-5.4",
-    "codex/gpt-5.4-mini": "azure/gpt-5.4-mini",
-    "codex/gpt-5.3-codex-spark": "zen/gpt-5.3-codex-spark",
-}
-
-
-def _quota_fallback_spec(model_spec: str) -> str | None:
-    return QUOTA_FALLBACK.get(model_spec)
 
 
 class CancelEvent(asyncio.Event):
@@ -66,9 +46,6 @@ class CancelEvent(asyncio.Event):
         if not self.is_set():
             self.reason = reason
         self.set()
-
-
-SANDBOX_EXEMPT_PROVIDERS = {"claude-sdk", "codex"}  # solvers hard-wired to the Docker sandbox
 
 
 def _resolve_executor_mode(settings) -> str:
@@ -137,159 +114,52 @@ class ChallengeSwarm:
     _last_progress_monotonic: float = 0.0  # last accepted (partial or full) flag
     message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
 
-    def _state_paths(self, model_spec: str):
+    def _workdir_for(self, model_spec: str) -> str:
+        """Per solver-run scratch dir for run_python isolation.
+
+        No checkpoint / resume subsystem: each run starts fresh (Less Is More —
+        a crashed task just reruns within its time budget). The dir is only a
+        private workspace for run_python artifacts, kept for post-mortems.
+        """
         state_dir = getattr(self.settings, "state_dir", ".ctf-state")
-        return (
-            solver_checkpoint_path(state_dir, self.meta.name, model_spec),
-            solver_workspace_path(state_dir, self.meta.name, model_spec).resolve(),
-        )
 
-    def _prepare_solver_state(self, model_spec: str) -> tuple[str, str]:
-        """Recover an interrupted trace and build the model's compact resume context."""
-        checkpoint_path, workspace_path = self._state_paths(model_spec)
-        checkpoint = refresh_checkpoint_from_latest_trace(
-            checkpoint_path,
-            challenge_name=self.meta.name,
-            model_spec=model_spec,
-            model_id=model_id_from_spec(model_spec),
-            current_trace="",
-            workspace_dir=str(workspace_path),
-        )
-        return str(workspace_path), build_resume_context(checkpoint)
+        def _slug(s: str) -> str:
+            return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-") or "x"
 
-    @staticmethod
-    def _next_step_for_result(result: SolverResult | None) -> str:
-        if result is None:
-            return "Inspect the restored workspace and checkpoint, then continue the most promising unfinished analysis."
-        if result.status == FLAG_FOUND:
-            return "Flag confirmed; no further solver work is required."
-        if result.flag:
-            return f"Verify the unconfirmed candidate {result.flag} against the challenge, then submit only if justified."
-        if result.status == ERROR:
-            return "Recover from the recorded error without repeating completed setup or failed commands."
-        if result.status == QUOTA_ERROR:
-            return "Resume the same analysis with the configured fallback model and reuse all workspace artifacts."
-        if result.findings_summary:
-            return f"Continue from the latest findings and try a materially different approach: {result.findings_summary[:1200]}"
-        return "Review prior key results and try a materially different, evidence-driven approach."
-
-    async def _persist_solver_state(
-        self,
-        solver: SolverProtocol,
-        state_model_spec: str,
-        result: SolverResult | None = None,
-        *,
-        next_step: str = "",
-        sync_workspace: bool = True,
-    ) -> None:
-        """Snapshot artifacts and merge the latest trace into the durable checkpoint."""
-        checkpoint_path, workspace_path = self._state_paths(state_model_spec)
-        sandbox = getattr(solver, "sandbox", None)
-        persist_workspace = getattr(sandbox, "persist_workspace", None)
-        if sync_workspace and callable(persist_workspace):
-            await persist_workspace()
-
-        tracer = getattr(solver, "tracer", None)
-        trace_path = str(getattr(tracer, "path", ""))
-        step_counter = getattr(solver, "_step_count", 0)
-        if isinstance(step_counter, list):
-            step_counter = step_counter[0] if step_counter else 0
-        step_count = result.step_count if result else int(step_counter or 0)
-        findings = result.findings_summary if result else str(getattr(solver, "_findings", ""))
-        flag = result.flag if result else getattr(solver, "_flag", None)
-        confirmed = bool(getattr(solver, "_confirmed", False))
-
-        try:
-            save_solver_checkpoint(
-                checkpoint_path,
-                challenge_name=self.meta.name,
-                model_spec=state_model_spec,
-                trace_path=trace_path,
-                step_count=step_count,
-                findings_summary=findings,
-                flag=flag,
-                confirmed=confirmed,
-                workspace_dir=str(workspace_path),
-                next_step=next_step or self._next_step_for_result(result),
-            )
-        except Exception as exc:
-            logger.warning(
-                "[%s/%s] Could not persist solver checkpoint: %s",
-                self.meta.name,
-                state_model_spec,
-                exc,
-            )
+        path = Path(state_dir) / "workspaces" / _slug(self.meta.name) / _slug(model_spec)
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path.resolve())
 
     def _effective_model_specs(self) -> list[str]:
-        """Drop solvers that cannot run under the active executor mode."""
-        if _resolve_executor_mode(self.settings) != "headless":
-            return list(self.model_specs)
-        usable = [
-            spec
-            for spec in self.model_specs
-            if provider_from_spec(spec) not in SANDBOX_EXEMPT_PROVIDERS
-        ]
-        skipped = [s for s in self.model_specs if s not in usable]
-        if skipped:
-            logger.warning(
-                "[%s] Headless mode skips sandbox-bound solver(s): %s",
-                self.meta.name,
-                ", ".join(skipped),
-            )
-        if not usable:
-            logger.error(
-                "[%s] No runnable solver in headless mode — configure a Pydantic AI "
-                "model (deepseek/qwen/azure/zen/google/bedrock) instead of %s",
-                self.meta.name,
-                ", ".join(self.model_specs),
-            )
-        return usable
+        """Runnable model specs. Headless-only now, so this is just the configured list."""
+        return list(self.model_specs)
 
     def _create_solver(self, model_spec: str):
-        """Create the right solver type based on provider and executor mode.
+        """Create a HeadlessSolver (the only solver type): one model, one live
+        target, no container — model reasoning plus the neutral http/tcp/python
+        tool surface."""
+        from backend.agents.headless_solver import HeadlessSolver
 
-        - headless executor → HeadlessSolver (no container; model-only + light tools)
-        - claude-sdk/* → ClaudeSolver (Claude Agent SDK, subscription-first)
-        - codex/* → CodexSolver (Codex App Server, subscription-first)
-        - bedrock/*, azure/*, zen/*, google/*, qwen/*, deepseek/* → Pydantic AI Solver
-        """
-        provider = provider_from_spec(model_spec)
-        executor_mode = _resolve_executor_mode(self.settings)
-        workspace_dir, resume_context = self._prepare_solver_state(model_spec)
-
-        def _submit_fn(flag): return self.try_submit_flag(flag, model_spec)
-        _notify = self._make_notify_fn(model_spec)
-
-        if executor_mode == "headless" and provider not in SANDBOX_EXEMPT_PROVIDERS:
-            from backend.agents.headless_solver import HeadlessSolver
-
-            time_budget = max(
-                300,
-                _time_limit_for_challenge(
-                    self.settings, self.meta, self.remaining_global_seconds
-                ) - 60,
-            )
-            return HeadlessSolver(
-                model_spec=model_spec,
-                meta=self.meta,
-                platform=self.platform,
-                cost_tracker=self.cost_tracker,
-                settings=self.settings,
-                cancel_event=self.cancel_event,
-                submit_fn=_submit_fn,
-                message_bus=self.message_bus,
-                notify_coordinator=_notify,
-                resume_context=resume_context,
-                allow_exec=bool(getattr(self.settings, "allow_local_exec", True)),
-                time_budget_seconds=time_budget,
-                workdir=workspace_dir,
-            )
-
-        return self._create_pydantic_solver(
-            model_spec,
-            state_model_spec=model_spec,
-            persistent_workspace_dir=workspace_dir,
-            resume_context=resume_context,
+        time_budget = max(
+            300,
+            _time_limit_for_challenge(
+                self.settings, self.meta, self.remaining_global_seconds
+            ) - 60,
+        )
+        return HeadlessSolver(
+            model_spec=model_spec,
+            meta=self.meta,
+            platform=self.platform,
+            cost_tracker=self.cost_tracker,
+            settings=self.settings,
+            cancel_event=self.cancel_event,
+            submit_fn=lambda flag: self.try_submit_flag(flag, model_spec),
+            message_bus=self.message_bus,
+            notify_coordinator=self._make_notify_fn(model_spec),
+            resume_context="",
+            allow_exec=bool(getattr(self.settings, "allow_local_exec", True)),
+            time_budget_seconds=time_budget,
+            workdir=self._workdir_for(model_spec),
         )
 
     def _make_notify_fn(self, model_spec: str):
@@ -300,41 +170,6 @@ class ChallengeSwarm:
                     f"[{self.meta.name}/{model_spec}] {message}"
                 )
         return _notify
-
-    def _create_pydantic_solver(
-        self,
-        model_spec: str,
-        sandbox=None,
-        owns_sandbox: bool | None = None,
-        *,
-        state_model_spec: str | None = None,
-        persistent_workspace_dir: str = "",
-        resume_context: str = "",
-    ) -> Solver:
-        """Create a Pydantic AI solver. Pass sandbox to reuse an existing container (quota fallback)."""
-        state_model_spec = state_model_spec or model_spec
-        if not persistent_workspace_dir:
-            persistent_workspace_dir, loaded_context = self._prepare_solver_state(state_model_spec)
-            resume_context = resume_context or loaded_context
-        solver = Solver(
-            model_spec=model_spec,
-            challenge_dir=self.challenge_dir,
-            meta=self.meta,
-            platform=self.platform,
-            cost_tracker=self.cost_tracker,
-            settings=self.settings,
-            cancel_event=self.cancel_event,
-            sandbox=sandbox,
-            owns_sandbox=owns_sandbox,
-            persistent_workspace_dir=persistent_workspace_dir,
-            resume_context=resume_context,
-        )
-        solver.deps.message_bus = self.message_bus
-        solver.deps.model_spec = model_spec
-        solver.deps.no_submit = self.no_submit
-        solver.deps.submit_fn = lambda flag: self.try_submit_flag(flag, model_spec)
-        solver.deps.notify_coordinator = self._make_notify_fn(model_spec)
-        return solver
 
     def _gather_sibling_insights(self, exclude_model: str) -> str:
         parts: list[str] = []
@@ -480,18 +315,11 @@ class ChallengeSwarm:
             logger.error(f"[{self.meta.name}/{model_spec}] Fatal: {e}", exc_info=True)
             return None
         finally:
-            if result is None:
-                await self._persist_solver_state(
-                    solver,
-                    model_spec,
-                    next_step=self._next_step_for_result(result),
-                    sync_workspace=False,
-                )
             stop_task = asyncio.create_task(solver.stop())
             try:
                 await asyncio.shield(stop_task)
             except asyncio.CancelledError:
-                # Let Docker/SDK clients close fully before propagating shutdown.
+                # Let the solver's clients close fully before propagating shutdown.
                 await stop_task
                 raise
 
@@ -510,15 +338,9 @@ class ChallengeSwarm:
             while self.pause_event.is_set() and not self.cancel_event.is_set():
                 await asyncio.sleep(0.5)
             result = await solver.run_until_done_or_gave_up()
-            await self._persist_solver_state(
-                solver,
-                model_spec,
-                result,
-                next_step=self._next_step_for_result(result),
-            )
 
             # Only broadcast useful findings — skip errors and broken solvers
-            if (result.status not in (ERROR, QUOTA_ERROR)
+            if (result.status != ERROR
                     and not (result.step_count == 0 and result.cost_usd == 0)
                     and result.findings_summary
                     and not result.findings_summary.startswith(("Error:", "Turn failed:"))):
@@ -534,31 +356,6 @@ class ChallengeSwarm:
                 return result, solver
 
             if result.status == CANCELLED:
-                break
-
-            # Quota exhaustion: fall back to API-backed Pydantic AI solver
-            if result.status == QUOTA_ERROR:
-                fallback_spec = _quota_fallback_spec(model_spec)
-                if fallback_spec:
-                    logger.warning(
-                        f"[{self.meta.name}/{model_spec}] Quota exhausted — falling back to {fallback_spec}"
-                    )
-                    existing_sandbox = solver.sandbox
-                    # Detach sandbox from old solver so stop() doesn't destroy it
-                    cast(Any, solver).sandbox = None
-                    await solver.stop()
-                    _, resume_context = self._prepare_solver_state(model_spec)
-                    solver = self._create_pydantic_solver(
-                        fallback_spec,
-                        sandbox=existing_sandbox,
-                        owns_sandbox=True,
-                        state_model_spec=model_spec,
-                        resume_context=resume_context,
-                    )
-                    self.solvers[model_spec] = solver
-                    await solver.start()
-                    continue
-                # No fallback available, treat as error
                 break
 
             if result.status in (GAVE_UP, ERROR):
@@ -601,13 +398,6 @@ class ChallengeSwarm:
                         pass
                 insights = self._gather_sibling_insights(model_spec)
                 solver.bump(insights)
-                await self._persist_solver_state(
-                    solver,
-                    model_spec,
-                    result,
-                    next_step=f"Apply this new guidance without repeating prior work: {insights[:1200]}",
-                    sync_workspace=False,
-                )
                 logger.info(
                     f"[{self.meta.name}/{model_spec}] Bumped ({bump_count}), resuming"
                 )
