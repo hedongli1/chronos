@@ -1,0 +1,94 @@
+# chronos 重写基线：Less Is More
+
+> 本文档是重写的**唯一基线**。开工前先 review 本文；代码改动若与本文冲突，以本文为准（或先改本文再改码）。
+
+## 0. 设计哲学（北极星）
+
+真正决定分数的是**模型本身的 agentic 推理能力**，不是外层的 Agent 架构，也不是一堆 Skill / 预设流程。因此本项目刻意做减法：
+
+1. **不针对靶场赛题定向优化提示词，不内嵌答案，不携带跨任务/跨轮记忆。** 每道题都从零开始面对，agent 不积累任何"题库/小抄"。
+2. **0 Skill、0 RAG、0 MCP；不做以任务角色为主的多 Agent 分解；不预设任何攻击流程。** 没有"侦察 agent / 利用 agent / 报告 agent"这类角色切分，没有按能力域写死的 playbook。
+3. **Less Is More。** 只保留"模型 + 中性工具面 + 遵守平台规则所必需的机械外壳"。
+
+## 1. 判定边界（删 / 留 的试金石）
+
+今后任何"这个要不要留"的争论，用这一条自测，不靠个案拍脑袋：
+
+> **它编码了"任务语义 / 领域知识 / 对本 benchmark 的经验拟合"吗？**
+> - 是 → **删**。（攻击方法论、题型分类驱动的提示词、按历史数据调出来的行为阈值，都属此类。）
+> - 否，它只是"平台机制 / 合规与正确性 / 可观测性 / 与模型无关的执行循环"吗？→ **留**。
+
+关键区分：**约束"能不能做"是中性护栏（留）；指导"该怎么打"是攻击脚手架（删）。** target-lock 约束的是授权范围与 flag 有效性，属前者。
+
+## 2. 目标架构（一页）
+
+```
+                 ┌─────────────────────────────┐
+                 │   机械调度器 (无 LLM)        │
+                 │   · 轮询题目/已解状态         │
+                 │   · 按分值/难度优先填槽        │
+                 │   · 并发窗口 & 单题时限        │
+                 │   · 全局时间预算 & 容器生命周期 │
+                 └──────────────┬──────────────┘
+                                │ 跨不同题目并发（N 个同构 worker，纯吞吐、无角色）
+        ┌───────────────┬───────┴───────┬───────────────┐
+        ▼               ▼               ▼               ▼
+   题目A swarm      题目B swarm      题目C swarm        ...
+        │
+        │ 同题可选多 solver（同构，无角色分工）
+        ▼
+   HeadlessSolver × M   ←──共享──→  message_bus（同题知识共享 / sibling findings / bump）
+        │
+        ▼
+   模型  +  中性工具面：http_request · tcp_send · run_python · submit_flag · task_status
+```
+
+- **调度器纯机械**：不再有 LLM 协调器做"策略推理"。它只做确定性编排，可复现、可调试。
+- **两种并行都保留**：跨题目的同构 worker 池（吞吐）；同题目的同构 solver swarm + 知识共享（质量）。两者都**不含角色分工**，不违反原则 2。
+- **系统提示词是纯契约**（见 §5），不含任何方法论。
+
+## 3. 删除清单（任务语义脚手架）
+
+| 删除项 | 位置 | 理由 |
+|---|---|---|
+| 六大能力域 playbook | `prompts.py::SCENARIO_PLAYBOOKS` + `build_headless_prompt` 注入 | 预设攻击流程（原则 2） |
+| 场景分类做**提示词塑形** | `prompts.py::_guess_scenario`（提示词用途） | benchmark 题型拟合（原则 1） |
+| 行为干预（历史数据调参） | `solver.py::NO_PROGRESS_*`、loop-break **劝导文案注入**、`request_hint` 复杂解锁经济学 | 把模型认知往本 benchmark 掰（原则 1） |
+| 跨任务/跨轮记忆 | coordinator 对话持久化、checkpoint 把上轮 findings 作为 resume context 回灌 | 原则 1 明确禁止 |
+| LLM 协调器 | `pydantic_coordinator.py` / `claude_coordinator.py` / `codex_coordinator.py` | 改纯机械调度 |
+| legacy 多后端 solver | `solver.py`(docker)、`claude_solver.py`、`codex_solver.py`、`sandbox.py`、`tools/sandbox.py` | 死代码，Less Is More |
+| 多余 provider 分支 | `models.py` 中未使用的 bedrock/azure/zen/google/claude-sdk/codex | 只留实际使用的 provider |
+
+## 4. 保留清单（中性基础设施，一律不删）
+
+- **中性工具面**：`http_request` / `tcp_send` / `run_python` / `submit_flag` / `task_status`。
+- **同题知识共享**：`message_bus.py`、sibling findings、bump —— 同构 solver 间共享发现，非角色分解，**保留**。
+- **合规/正确性护栏**：target-lock + `run_python` 主机白名单（授权范围约束）。建议进一步简化为**纯结构性主机白名单、零关键词猜测**。
+- **平台机制**：单题时限、并发窗口、容器生命周期（start/close/ghost-reap）、flag 去重、尊重平台错误提交上限、全局时间预算感知。
+- **可观测性**：JSONL trace + cost tracker（支撑 TSec"过程可追溯"，中性）。
+- **启动自检**：VPN 健康检查、平台连通性 smoke test。
+
+## 5. 系统提示词契约（纯操作性，零方法论）
+
+提示词**只**包含：
+
+1. **目标**：在"分配给你的授权目标"上取得 flag。
+2. **工具契约**：每个工具的输入/输出与用途（机械描述，不含"先做 X 再做 Y"的流程建议）。
+3. **提交格式**：flag 形态与 `submit_flag` 语义（含多 flag 部分得分）。
+4. **硬约束**：范围=分配目标（勿碰 VPN 上其他实例）、时间预算、禁止编造/猜测 flag、本地磁盘不可信。
+
+**不包含**：任何"怎么打"的方法论、题型判断、payload 范式、按维度的思路清单。
+
+## 6. 待确认 / 开放项
+
+- **（最高优先级）模型选择**：拆掉全部弱模型补偿后，分数会更直接地等于模型本身能力。继续 DeepSeek，还是换更强的通用模型？架构与模型无关，但这是**最大的单一分数杠杆**。*—— 待你定。*
+- **崩溃恢复 checkpoint**：是否保留"同一道题进程崩溃后原地续跑"的纯韧性机制（不回灌 findings，只恢复进度）？倾向：Less Is More 下可直接丢弃，崩了就在时限内重开。*—— 倾向删，待确认。*
+- **loop 检测**：检测本身作为 trace 遥测保留；但往结果里注入"你在循环，换个思路"的劝导文案删除（属认知塑形）。*—— 倾向如此，待确认。*
+
+## 7. 落地顺序（review 通过后）
+
+1. 砍 legacy 多后端 + LLM 协调器 → 只剩 headless solver + 机械调度器（最大体量的净瘦身，先做）。
+2. 删 playbook / 场景提示词塑形 / 行为干预 → 提示词收敛为 §5 契约。
+3. 简化 target-lock 为纯结构性白名单。
+4. 清理 config / README / .env.example，与新架构对齐。
+5. 全程 `ruff check` + `py_compile` 守底线；每步独立 commit，便于回滚与 review。
