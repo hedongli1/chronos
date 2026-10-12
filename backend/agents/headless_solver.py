@@ -13,7 +13,6 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
@@ -48,19 +47,6 @@ logger = logging.getLogger(__name__)
 FLAG_TOKEN_RE = re.compile(r"(?i)(?:flag|CTF)\{[^{}\r\n]{1,256}\}")
 TOOL_MAX_RETRIES = 8
 TASK_TIME_BUDGET_SECONDS = 55 * 60  # platform hard limit is 60 min per task
-
-# Hard gate for the score-deducting hint: past runs showed hints requested in
-# the first minutes of a task are pure loss (the task stayed unsolved anyway),
-# but runs already doomed (rejected submissions, stalled progress) benefit from
-# an early unlock — see _HintGate. Values are defaults; Settings overrides them.
-@dataclass(frozen=True)
-class _HintGate:
-    min_steps: int = 20
-    min_seconds: int = 600
-    stall_steps: int = 30
-    stall_min_steps: int = 10
-    stall_min_seconds: int = 300
-    stall_wrong_submissions: int = 2
 
 
 def _extract_flag_candidates(text: str) -> list[str]:
@@ -156,10 +142,7 @@ def _build_toolset(
     deps: HeadlessDeps,
     tracer: SolverTracer,
     step_counter: list[int],
-    started_monotonic: float,
-    hint_gate: _HintGate | None = None,
 ) -> FunctionToolset[HeadlessDeps]:
-    gate = hint_gate or _HintGate()
     toolset: FunctionToolset[HeadlessDeps] = FunctionToolset(max_retries=TOOL_MAX_RETRIES)
 
     @toolset.tool
@@ -275,47 +258,12 @@ def _build_toolset(
 
     @toolset.tool
     async def request_hint(ctx: RunContext[HeadlessDeps]) -> str:
-        """Request the platform hint for this task. WARNING: deducts 10% of the score.
+        """Fetch the platform hint for this task.
 
-        Hard limits: at most ONE hint per task. The hint is gated — it unlocks
-        after 20+ tool steps AND 10+ minutes of genuine work, OR earlier (once
-        10+ steps AND 5+ minutes have passed) when the run shows doom signals:
-        2 platform-rejected submissions, or no new confirmed flag and no new
-        finding for 30 steps. Denials state the exact unlock criteria."""
-        steps = step_counter[0] if step_counter else 0
-        elapsed = time.monotonic() - started_monotonic
-        rejected = len(ctx.deps.rejected_flags)
-        stalled_for = steps - ctx.deps.last_progress_step
-        normal_ok = steps >= gate.min_steps and elapsed >= gate.min_seconds
-        floor_ok = steps >= gate.stall_min_steps and elapsed >= gate.stall_min_seconds
-        wrong_trigger = gate.stall_wrong_submissions > 0 and rejected >= gate.stall_wrong_submissions
-        stall_trigger = gate.stall_steps > 0 and stalled_for >= gate.stall_steps
-        if not (normal_ok or (floor_ok and (wrong_trigger or stall_trigger))):
-            return (
-                "HINT DENIED — hints deduct 10% of this task's score, and hints "
-                "used before real progress are pure loss. "
-                f"Status: {steps} tool steps, {int(elapsed) // 60} min elapsed, "
-                f"{rejected} platform-rejected submissions, "
-                f"{stalled_for} steps since the last confirmed flag or new finding. "
-                f"The hint unlocks at >={gate.min_steps} steps AND "
-                f">={gate.min_seconds // 60} min — OR earlier, once >={gate.stall_min_steps} "
-                f"steps AND >={gate.stall_min_seconds // 60} min have passed, when "
-                f"{gate.stall_wrong_submissions} submissions are platform-rejected "
-                f"OR progress stalls for {gate.stall_steps} steps. "
-                "Do not retry blindly: keep attacking a different surface, or work "
-                "until one of the doom signals above trips the early unlock."
-            )
+        Note: the hint DEDUCTS score and can be requested at most once per task.
+        Decide for yourself whether it is worth it — there is no gate."""
         if ctx.deps.hint_used:
-            return "HINT DENIED — this task's one hint was already used. Work with what you have."
-        reason = (
-            "threshold" if normal_ok
-            else "rejected_submissions" if wrong_trigger
-            else "stalled_progress"
-        )
-        tracer.event(
-            "hint_gate_passed", reason=reason, steps=steps,
-            rejected_submissions=rejected, stalled_for_steps=stalled_for,
-        )
+            return "This task's one hint was already used."
         fetch = getattr(ctx.deps.platform, "fetch_hint", None)
         if not callable(fetch):
             return "No hint API on this platform. Reason from the target's behavior instead."
@@ -424,15 +372,6 @@ class HeadlessSolver:
         )
         self.loop_detector = LoopDetector()
         self.tracer = SolverTracer(meta.name, self.model_id)
-        s = settings
-        self._hint_gate = _HintGate(
-            min_steps=int(getattr(s, "hint_min_steps", _HintGate.min_steps)),
-            min_seconds=int(getattr(s, "hint_min_seconds", _HintGate.min_seconds)),
-            stall_steps=int(getattr(s, "hint_stall_steps", _HintGate.stall_steps)),
-            stall_min_steps=int(getattr(s, "hint_stall_min_steps", _HintGate.stall_min_steps)),
-            stall_min_seconds=int(getattr(s, "hint_stall_min_seconds", _HintGate.stall_min_seconds)),
-            stall_wrong_submissions=int(getattr(s, "hint_stall_wrong_submissions", _HintGate.stall_wrong_submissions)),
-        )
         self.agent_name = f"{meta.name}/{self.model_id}"
         self._agent: Agent[HeadlessDeps, str] | None = None
         self._messages: list = []
@@ -488,9 +427,7 @@ class HeadlessSolver:
 
         model = resolve_model(self.model_spec, self.settings)
         model_settings = resolve_model_settings(self.model_spec)
-        raw_toolset = _build_toolset(
-            self.deps, self.tracer, self._step_count, time.monotonic(), self._hint_gate,
-        )
+        raw_toolset = _build_toolset(self.deps, self.tracer, self._step_count)
 
         from backend.agents.tracing_toolset import TracingToolset
 

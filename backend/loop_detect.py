@@ -53,13 +53,3 @@ class LoopDetector:
 
     def reset(self) -> None:
         self._recent.clear()
-
-
-LOOP_WARNING_MESSAGE = (
-    "⚠️ **You are stuck in a loop** — you have run the exact same command multiple times "
-    "with identical results. STOP repeating this command. Step back, reconsider your approach, "
-    "and try a **completely different** technique or tool. "
-    "If you were grepping/searching, try a Python script instead. "
-    "If you were analyzing one aspect of the file, switch to another. "
-    "What other angles haven't you explored?"
-)
