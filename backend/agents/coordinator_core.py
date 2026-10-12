@@ -1,12 +1,14 @@
-"""Shared coordinator tool logic — called by both Claude SDK and Codex coordinators."""
+"""Mechanical scheduler helpers: spawn, run-with-budget, lifecycle, kill.
+
+No LLM-facing tool wrappers live here anymore — the scheduler calls these
+functions directly.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
-from collections import deque
 from pathlib import Path
 
 from backend.deps import CoordinatorDeps
@@ -18,67 +20,6 @@ logger = logging.getLogger(__name__)
 # A swarm that finishes below this many steps almost certainly hit a startup
 # problem (dead container, transient API error) rather than a real solve attempt.
 EARLY_EXIT_MIN_STEPS = 15
-
-# Appended to every coordinator system prompt. Bumps that assert invented
-# "facts" (endpoints, services, files, credentials, strings) with authority have
-# repeatedly sent solvers chasing phantoms, so composition is restricted to
-# cited evidence plus clearly-labeled hypotheses.
-BUMP_DISCIPLINE = """\
-
-BUMP DISCIPLINE (applies to bump_agent, broadcast, and ANY message you send to solvers):
-- Restate ONLY evidence you actually saw in read_solver_trace output or another
-  tool result this session. Quote or cite it (e.g. "step 42 RESULT nmap: ...").
-- NEVER assert the existence of an endpoint, service, file, credential, or
-  string you did not see in a tool result. No invented "AUTHORITATIVE FIX" claims.
-- Hypotheses are allowed only when clearly labeled as unverified — write
-  "HYPOTHESIS (unverified) / 假设（未验证）: ..." — and paired with ONE concrete,
-  cheap verification step the solver can run first (e.g. "curl -s http://target/check").
-- Local-disk artifacts are unreliable evidence: solvers share one runner disk,
-  so files (web_source.txt, routes*.py, bundle.js, ...) may belong to a DIFFERENT
-  challenge. Never tell a solver to trust a file unless its own trace shows the
-  file was produced while working on THIS challenge.
-- If an earlier bump of yours was wrong, say so explicitly and briefly first
-  ("Correction: my earlier claim about X was wrong — disregard it"), then give
-  the new guidance.
-- Keep bumps short and actionable: cited evidence, then the hypothesis with its
-  verification step, then the next action.
-"""
-
-
-def _tail_lines(path: str, count: int) -> list[str]:
-    with Path(path).open(encoding="utf-8", errors="replace") as stream:
-        return list(deque(stream, maxlen=max(1, count)))
-
-
-async def do_fetch_challenges(deps: CoordinatorDeps) -> str:
-    challenges = await deps.platform.fetch_all_challenges()
-    solved = await deps.platform.fetch_solved_names()
-    result = [
-        {
-            "name": ch.get("name", "?"),
-            "category": ch.get("category", "?"),
-            "value": ch.get("value", 0),
-            "solves": ch.get("solves", 0),
-            "status": "SOLVED" if ch.get("name") in solved else "unsolved",
-            "description": (ch.get("description") or "")[:200],
-        }
-        for ch in challenges
-    ]
-    return json.dumps(result, indent=2)
-
-
-async def do_get_solve_status(deps: CoordinatorDeps) -> str:
-    solved = await deps.platform.fetch_solved_names()
-    swarm_status = {name: swarm.get_status() for name, swarm in deps.swarms.items()}
-    return json.dumps(
-        {
-            "solved": sorted(solved),
-            "active_swarms": swarm_status,
-            "pending_spawns": sorted(deps.pending_spawns),
-            "deferred_challenges": deps.deferred_challenges,
-        },
-        indent=2,
-    )
 
 
 async def do_spawn_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
@@ -276,91 +217,14 @@ async def _recover_challenge_environment(deps: CoordinatorDeps, challenge_name: 
     deps.open_containers.discard(challenge_name)
 
 
-async def do_check_swarm_status(deps: CoordinatorDeps, challenge_name: str) -> str:
-    swarm = deps.swarms.get(challenge_name)
-    if not swarm:
-        return f"No swarm running for {challenge_name}"
-    return json.dumps(swarm.get_status(), indent=2)
-
-
-async def do_submit_flag(deps: CoordinatorDeps, challenge_name: str, flag: str) -> str:
-    if deps.no_submit:
-        return f'DRY RUN — would submit "{flag.strip()}" for {challenge_name}'
-    try:
-        result = await deps.platform.submit_flag(challenge_name, flag)
-        return result.display
-    except Exception as e:
-        return f"submit_flag error: {e}"
-
-
 async def do_kill_swarm(deps: CoordinatorDeps, challenge_name: str) -> str:
     swarm = deps.swarms.get(challenge_name)
     if not swarm:
         return f"No swarm running for {challenge_name}"
     swarm.kill("operator")
-    deps.deferred_challenges[challenge_name] = "stopped by coordinator"
+    deps.deferred_challenges[challenge_name] = "stopped by operator"
     task = deps.swarm_tasks.get(challenge_name)
     if task and not task.done():
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     return f"Swarm for {challenge_name} cancelled"
-
-
-async def do_bump_agent(deps: CoordinatorDeps, challenge_name: str, model_spec: str, insights: str) -> str:
-    swarm = deps.swarms.get(challenge_name)
-    if not swarm:
-        return f"No swarm running for {challenge_name}"
-    solver = swarm.solvers.get(model_spec)
-    if not solver:
-        return f"No solver for {model_spec} in {challenge_name}"
-    solver.bump(insights)
-    return f"Bumped {model_spec} on {challenge_name}"
-
-
-async def do_read_solver_trace(deps: CoordinatorDeps, challenge_name: str, model_spec: str, last_n: int = 20) -> str:
-    """Read the last N trace events from a solver's JSONL log."""
-    swarm = deps.swarms.get(challenge_name)
-    if not swarm:
-        return f"No swarm for {challenge_name}"
-    solver = swarm.solvers.get(model_spec)
-    if not solver:
-        return f"No solver for {model_spec}"
-    trace_path = getattr(solver, "tracer", None)
-    if not trace_path:
-        return "No tracer on solver"
-    path = trace_path.path if hasattr(trace_path, "path") else str(trace_path)
-    try:
-        recent = await asyncio.to_thread(_tail_lines, path, last_n)
-        summary = []
-        for line in recent:
-            try:
-                d = json.loads(line)
-                t = d.get("type", "?")
-                if t == "tool_call":
-                    args_str = str(d.get("args", ""))[:100]
-                    summary.append(f"step {d.get('step','?')} CALL {d.get('tool','?')}: {args_str}")
-                elif t == "tool_result":
-                    result_str = str(d.get("result", ""))[:100]
-                    summary.append(f"step {d.get('step','?')} RESULT {d.get('tool','?')}: {result_str}")
-                elif t in ("finish", "error", "bump", "turn_failed"):
-                    summary.append(f"** {t}: {json.dumps({k:v for k,v in d.items() if k != 'ts'})}")
-                elif t == "usage":
-                    summary.append(f"usage: in={d.get('input_tokens',0)} out={d.get('output_tokens',0)} cost=${d.get('cost_usd',0):.4f}")
-                else:
-                    summary.append(f"{t}: {str(d)[:80]}")
-            except Exception:
-                summary.append(line[:100])
-        return "\n".join(summary)
-    except FileNotFoundError:
-        return f"Trace file not found: {path}"
-    except Exception as e:
-        return f"Error reading trace: {e}"
-
-
-async def do_broadcast(deps: CoordinatorDeps, challenge_name: str, message: str) -> str:
-    """Broadcast a message to all solvers working on a challenge."""
-    swarm = deps.swarms.get(challenge_name)
-    if not swarm:
-        return f"No swarm running for {challenge_name}"
-    await swarm.message_bus.broadcast(message)
-    return f"Broadcast to all solvers on {challenge_name}"

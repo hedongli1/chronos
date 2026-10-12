@@ -112,13 +112,6 @@ async def _check_benchmark_task(settings: Settings) -> bool:
 @click.option("--no-submit", is_flag=True, help="Dry run — don't submit flags")
 @click.option("--smoke-test", is_flag=True, help="Run a read-only TSecBench platform smoke test")
 @click.option("--model-smoke-test", is_flag=True, help="Run a read-only LLM API connectivity smoke test")
-@click.option("--coordinator-model", default=None, help="Coordinator model spec (default: deepseek/deepseek-chat)")
-@click.option(
-    "--coordinator",
-    default="deepseek",
-    type=click.Choice(["deepseek", "qwen", "glm"]),
-    help="Coordinator backend (default: deepseek)",
-)
 @click.option(
     "--max-challenges",
     default=3,
@@ -147,8 +140,6 @@ def main(
     no_submit: bool,
     smoke_test: bool,
     model_smoke_test: bool,
-    coordinator_model: str | None,
-    coordinator: str,
     max_challenges: int,
     dashboard_port: int,
     dashboard_host: str,
@@ -253,9 +244,6 @@ def main(
                 model_specs,
                 challenges_dir,
                 no_submit,
-                coordinator_model,
-                coordinator,
-                max_challenges,
                 interactive,
             )
         )
@@ -358,38 +346,19 @@ async def _run_coordinator(
     model_specs: list[str],
     challenges_dir: str,
     no_submit: bool,
-    coordinator_model: str | None,
-    coordinator_backend: str,
-    max_challenges: int,
     interactive: bool = False,
 ) -> None:
-    """Run the full coordinator (continuous until Ctrl+C)."""
-    from backend.agents.swarm import _resolve_executor_mode
+    """Run the mechanical scheduler (continuous until all solved or Ctrl+C)."""
+    label = "mechanical scheduler" + (" + REPL" if interactive else "")
+    console.print(f"[bold]Starting {label} (Ctrl+C to stop)...[/bold]\n")
 
-    if _resolve_executor_mode(settings) == "docker":
-        from backend.sandbox import cleanup_orphan_containers, configure_semaphore
+    from backend.agents.scheduler import run_scheduler
 
-        max_containers = max_challenges * len(model_specs)
-        configure_semaphore(max_containers)
-        await cleanup_orphan_containers()
-
-    mode_label = coordinator_backend
-    if interactive:
-        mode_label += " + REPL"
-    console.print(f"[bold]Starting coordinator ({mode_label}, Ctrl+C to stop)...[/bold]\n")
-
-    from backend.agents.pydantic_coordinator import run_pydantic_coordinator
-    if coordinator_model is None:
-        if coordinator_backend == "qwen":
-            coordinator_model = "qwen/qwen-plus"
-        elif coordinator_backend == "glm":
-            coordinator_model = f"glm/{settings.glm_model_id}"
-    results = await run_pydantic_coordinator(
+    results = await run_scheduler(
         settings=settings,
         model_specs=model_specs,
         challenges_root=challenges_dir,
         no_submit=no_submit,
-        coordinator_model=coordinator_model,
         interactive=interactive,
     )
 
