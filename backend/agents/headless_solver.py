@@ -32,7 +32,12 @@ from backend.models import (
     supports_vision,
 )
 from backend.platforms import CompetitionPlatform
-from backend.prompts import ChallengeMeta, _guess_scenario, build_headless_prompt
+from backend.prompts import (
+    ChallengeMeta,
+    _guess_scenario,
+    _killchain_lock_open,
+    build_headless_prompt,
+)
 from backend.solver_base import CANCELLED, ERROR, FLAG_FOUND, GAVE_UP, SolverResult
 from backend.tools.local_exec import do_run_python
 from backend.tools.net_tools import do_raw_http, do_tcp_send
@@ -58,9 +63,14 @@ class _HintGate:
     stall_wrong_submissions: int = 2
 
 
-def _extract_unique_flag_candidate(text: str) -> str | None:
-    candidates = list(dict.fromkeys(FLAG_TOKEN_RE.findall(text)))
-    return candidates[0] if len(candidates) == 1 else None
+def _extract_flag_candidates(text: str) -> list[str]:
+    """All distinct flag-shaped tokens in final model output, in order seen.
+
+    Multi-flag tasks can legitimately have the model list several captured
+    flags in its closing summary — the rescue path below must be able to
+    submit all of them, not just bail out whenever more than one appears.
+    """
+    return list(dict.fromkeys(FLAG_TOKEN_RE.findall(text)))
 
 
 def _norm_flag_text(value: str) -> str:
@@ -108,14 +118,17 @@ def _target_lock_block(deps: HeadlessDeps, host: str) -> str | None:
 
     Killchain (multi-stage) tasks legitimately pivot to newly discovered hosts,
     so the lock only applies to single-target scenarios — playbook discipline
-    covers the rest.
+    covers the rest. Whether a task qualifies for this bypass is decided once,
+    structurally, at construction time (`deps.lock_open` — see
+    `backend.prompts._killchain_lock_open`), NOT by re-guessing the scenario
+    from free text here.
 
     Fail-loud: an empty allowed-hosts set must NOT silently disable the lock
     (the c-03 incident: unresolved connection_info let a run drift onto three
     other teams' instances). With no known target, ALL egress is refused and
     the model is told how to obtain/confirm the target.
     """
-    if deps.scenario == "killchain":
+    if deps.lock_open:
         return None
     if not deps.allowed_hosts:
         return (
@@ -214,7 +227,7 @@ def _build_toolset(
         # Pass the allowed-hosts set through even when empty: do_run_python
         # treats None as "no lock" and an empty set as the degraded
         # no-target-known lock (localhost only).
-        allowed = None if ctx.deps.scenario == "killchain" else ctx.deps.allowed_hosts
+        allowed = None if ctx.deps.lock_open else ctx.deps.allowed_hosts
         return await do_run_python(
             code,
             timeout=timeout,
@@ -386,6 +399,7 @@ class HeadlessSolver:
         self.time_budget_seconds = time_budget_seconds
 
         self.use_vision = supports_vision(model_spec)
+        parsed_hosts = _parse_allowed_hosts(meta.connection_info)
         self.deps = HeadlessDeps(
             platform=platform,
             challenge_name=meta.name,
@@ -401,8 +415,12 @@ class HeadlessSolver:
             flags_total=max(1, meta.flag_count),
             flags_accepted=meta.correct_flag_count,
             deadline_monotonic=time.monotonic() + time_budget_seconds,
-            allowed_hosts=_parse_allowed_hosts(meta.connection_info),
+            allowed_hosts=parsed_hosts,
             scenario=_guess_scenario(meta),
+            # Structural + heuristic gate — see _killchain_lock_open docstring.
+            # A single mis-tagged keyword can no longer open the lock on its
+            # own; the task must also announce >=2 hosts up front.
+            lock_open=_killchain_lock_open(meta, parsed_hosts),
         )
         self.loop_detector = LoopDetector()
         self.tracer = SolverTracer(meta.name, self.model_id)
@@ -440,7 +458,7 @@ class HeadlessSolver:
             remaining_seconds=remaining,
             allow_exec=self.allow_exec,
         )
-        if self.deps.scenario != "killchain" and not self.deps.allowed_hosts:
+        if not self.deps.lock_open and not self.deps.allowed_hosts:
             # Degraded target lock: no target hosts could be parsed from
             # connection_info, so the lock refuses ALL egress instead of
             # silently running unlocked. Make it loud in both trace and prompt.
@@ -527,8 +545,14 @@ class HeadlessSolver:
 
             output = result.output
             if isinstance(output, str) and output.strip():
-                candidate = _extract_unique_flag_candidate(output)
-                if candidate and not self.deps.confirmed_flag:
+                # Rescue every distinct flag-shaped token in the closing text,
+                # not just the case where exactly one appears — a multi-flag
+                # task's final summary can legitimately list several captured
+                # flags, and the old "only if there's exactly one" rule
+                # silently dropped all of them whenever that happened.
+                for candidate in _extract_flag_candidates(output):
+                    if self.deps.confirmed_flag:
+                        break
                     await self._submit_final_output_candidate(candidate)
             if self.deps.confirmed_flag:
                 self._confirmed = True
@@ -540,8 +564,6 @@ class HeadlessSolver:
                 self._findings = "Model returned without using any tools."
                 return self._result(ERROR)
 
-            if self._flag and not self._confirmed:
-                return self._result(GAVE_UP)
             return self._result(GAVE_UP)
 
         except asyncio.CancelledError:

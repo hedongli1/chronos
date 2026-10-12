@@ -63,10 +63,14 @@ NO_PROGRESS_WARNING = (
 )
 
 
-def _extract_unique_flag_candidate(text: str) -> str | None:
-    """Return one unambiguous, well-formed flag token from model output."""
-    candidates = list(dict.fromkeys(FLAG_TOKEN_RE.findall(text)))
-    return candidates[0] if len(candidates) == 1 else None
+def _extract_flag_candidates(text: str) -> list[str]:
+    """All distinct flag-shaped tokens in final model output, in order seen.
+
+    Multi-flag tasks can legitimately have the model list several captured
+    flags in its closing summary — the rescue path must be able to submit all
+    of them, not just bail out whenever more than one appears.
+    """
+    return list(dict.fromkeys(FLAG_TOKEN_RE.findall(text)))
 
 
 @dataclass
@@ -329,11 +333,17 @@ class Solver:
 
             output = result.output
             if isinstance(output, str) and output.strip():
-                candidate = _extract_unique_flag_candidate(output)
-                if candidate:
-                    self._flag = candidate
-                    self._findings = f"Flag candidate from model output: {candidate}"
-                    if not self.deps.confirmed_flag:
+                # Rescue every distinct flag-shaped token in the closing text —
+                # a multi-flag task's final summary can legitimately list
+                # several captured flags, and submitting only when exactly one
+                # token appeared silently dropped the rest.
+                candidates = _extract_flag_candidates(output)
+                if candidates:
+                    self._flag = candidates[-1]
+                    self._findings = f"Flag candidate(s) from model output: {', '.join(candidates)}"
+                    for candidate in candidates:
+                        if self.deps.confirmed_flag:
+                            break
                         await self._submit_final_output_candidate(candidate)
             # Platform confirmation always counts (the primary path when not in dry-run)
             if self.deps.confirmed_flag:
@@ -351,11 +361,9 @@ class Solver:
                 self._findings = "Model returned without using any tools."
                 return self._result(ERROR)
 
-            # For normal non-flag text, keep the solver alive so it can continue
-            # with the next bump instead of being forced into output validation.
-            if self._flag and not self._confirmed:
-                return self._result(GAVE_UP)
-
+            # For normal non-flag text, keep the solver alive so it can
+            # continue with the next bump instead of being forced into output
+            # validation.
             return self._result(GAVE_UP)
 
         except asyncio.CancelledError:

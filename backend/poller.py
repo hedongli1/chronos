@@ -27,6 +27,10 @@ class PlatformPoller:
 
     _known_challenges: set[str] = field(default_factory=set)
     _known_solved: set[str] = field(default_factory=set)
+    # Latest full stub dict per challenge name (value/level/category/etc) —
+    # kept so the scheduler can prioritize by score/difficulty instead of
+    # only knowing which names exist.
+    _known_stubs: dict[str, dict] = field(default_factory=dict)
     _event_queue: asyncio.Queue[PollEvent] = field(default_factory=asyncio.Queue)
     _task: asyncio.Task | None = field(default=None, repr=False)
     _stop: asyncio.Event = field(default_factory=asyncio.Event)
@@ -46,6 +50,7 @@ class PlatformPoller:
         try:
             stubs, solved = await self._fetch_state()
             self._known_challenges = {ch["name"] for ch in stubs}
+            self._known_stubs = {ch["name"]: ch for ch in stubs}
             self._known_solved = solved
         except Exception as e:
             logger.warning("Initial poll error: %s", e)
@@ -92,6 +97,11 @@ class PlatformPoller:
     def known_solved(self) -> set[str]:
         return set(self._known_solved)
 
+    @property
+    def known_stubs(self) -> dict[str, dict]:
+        """Latest stub dict per challenge name (value/level/category/...)."""
+        return dict(self._known_stubs)
+
     async def _poll_once(self) -> None:
         try:
             stubs, current_solved = await self._fetch_state()
@@ -123,6 +133,7 @@ class PlatformPoller:
                 )
 
             self._known_challenges = current_names
+            self._known_stubs = {ch["name"]: ch for ch in stubs}
             self._known_solved = current_solved
 
         except Exception as e:

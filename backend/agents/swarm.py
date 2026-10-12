@@ -82,14 +82,23 @@ def _resolve_executor_mode(settings) -> str:
     return "docker"
 
 
-def _time_limit_for_challenge(settings, meta) -> int:
-    """Per-challenge wall-clock budget; killchain tasks get a longer one."""
+def _time_limit_for_challenge(settings, meta, remaining_global_seconds: float | None = None) -> int:
+    """Per-challenge wall-clock budget; killchain tasks get a longer one.
+
+    remaining_global_seconds, when given (total_benchmark_budget_seconds is
+    configured), clamps the result so a single challenge can never be handed
+    a time limit longer than what is actually left of the WHOLE run. Without
+    this, a 45-minute killchain budget could be granted with 10 minutes left
+    on the clock, guaranteeing the platform force-closes it mid-attempt.
+    """
     limit = int(getattr(settings, "challenge_time_limit_seconds", 1800))
     if meta is not None:
         from backend.prompts import _guess_scenario
 
         if _guess_scenario(meta) == "killchain":
             limit = max(limit, int(getattr(settings, "killchain_time_limit_seconds", 2700)))
+    if remaining_global_seconds is not None:
+        limit = max(60, min(limit, int(remaining_global_seconds)))
     return limit
 
 
@@ -105,6 +114,11 @@ class ChallengeSwarm:
     model_specs: list[str] = field(default_factory=lambda: list(DEFAULT_MODELS))
     no_submit: bool = False
     coordinator_inbox: asyncio.Queue | None = None
+    # Snapshot (taken once, at spawn time) of how much of the WHOLE run's
+    # wall-clock budget is left, when total_benchmark_budget_seconds is
+    # configured. None means untracked — every time-limit decision stays
+    # purely per-challenge, exactly as before this field existed.
+    remaining_global_seconds: float | None = None
 
     cancel_event: CancelEvent = field(default_factory=CancelEvent)
     pause_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -251,7 +265,9 @@ class ChallengeSwarm:
 
             time_budget = max(
                 300,
-                _time_limit_for_challenge(self.settings, self.meta) - 60,
+                _time_limit_for_challenge(
+                    self.settings, self.meta, self.remaining_global_seconds
+                ) - 60,
             )
             return HeadlessSolver(
                 model_spec=model_spec,

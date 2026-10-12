@@ -45,7 +45,9 @@ Headless：模型 + http_request / tcp_send / run_python
 - **部分得分止损**：多 flag 题拿到部分分后，若 600 秒（`PARTIAL_STALL_SECONDS`）内没有新 flag 被接受，带着已有分数撤退换题
 - **差异化时限**：多阶段渗透（killchain）类题目自动放宽到 2700 秒（`KILLCHAIN_TIME_LIMIT_SECONDS`），其余题 1800 秒
 - **DeepSeek 多 Key 轮换**：`DEEPSEEK_EXTRA_API_KEYS` 可配额外 API Key（逗号分隔），每个 solver/协调器实例启动时按轮转分配 Key，并发下的限流配额成倍放大；429 重试上限从 SDK 默认 2 次提升到 6 次（指数退避）
-- **启动前 VPN 健康检查**：探测 `http://10.0.100.58`，未连接 VPN 直接退出
+- **启动前 VPN 健康检查**：探测 `VPN_HEALTH_CHECK_URL`（默认 `http://10.0.100.58`），未连接 VPN 直接退出
+- **全局时间预算感知**（可选，默认关闭）：设置 `TOTAL_BENCHMARK_BUDGET_SECONDS`（如 Tsecbench v1 的 360 分钟 = 21600）后，调度器会在总预算只剩 `MIN_REMAINING_SECONDS_TO_SPAWN`（默认 300 秒）时停止开新题，并把新题的单题时限钳制到"实际剩余时间"以内——避免在明知跑不完全部题目的情况下，仍按固定单题预算盲目开新容器，直到被平台强制掐断
+- **调度优先级**：自动补位不再按题名字母序，而是按"分值降序、难度等级升序"排列候选队列——title 内题目分值差异很大，字母序与总分最大化毫无关系
 
 ## 快速开始
 
@@ -143,6 +145,7 @@ uv run ctf-solve [OPTIONS]
 --challenge REF             单题模式（目录、题名或 unique_code）
 --max-challenges N          并发靶场窗口（1-3，默认 3，按存活容器数限流）
 --time-limit SECONDS        单题墙钟上限（默认 1800，超时关靶场换题）
+--total-budget-seconds N    全局总预算（默认关闭；设置后钳制单题时限+预算告急停止开新题）
 --no-submit                 干跑，不提交 flag
 --no-exec                   禁用 run_python
 --smoke-test / --model-smoke-test

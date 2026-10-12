@@ -29,11 +29,11 @@ def _setup_logging(verbose: bool = False) -> None:
     logging.basicConfig(level=level, handlers=[handler], force=True)
 
 
-async def _check_benchmark_vpn(base_url: str) -> bool:
+async def _check_benchmark_vpn(base_url: str, health_check_url: str) -> bool:
     """Verify the VPN-only health endpoint before starting any benchmark run."""
     try:
         async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
-            resp = await client.get("http://10.0.100.58")
+            resp = await client.get(health_check_url)
     except Exception as e:
         console.print(f"[bold red]VPN check failed:[/bold red] {e}")
         console.print("请先确认 VPN 已连接，然后重新启动 Agent。")
@@ -99,6 +99,13 @@ async def _check_benchmark_task(settings: Settings) -> bool:
 )
 @click.option("--no-exec", is_flag=True, help="Headless mode: disable the local run_python tool")
 @click.option("--time-limit", default=None, type=int, help="Per-challenge wall-clock seconds (default: 1800)")
+@click.option(
+    "--total-budget-seconds",
+    default=None,
+    type=int,
+    help="Total wall-clock budget for the whole run (e.g. 21600 for a 360-minute title). "
+    "0/unset disables global-budget tracking (per-challenge limits only, old behavior).",
+)
 @click.option("--models", multiple=True, help="Model specs (default: deepseek/deepseek-chat)")
 @click.option("--challenge", default=None, help="Solve a single challenge (directory, name, or unique_code)")
 @click.option("--challenges-dir", default="challenges", help="Directory for challenge files")
@@ -133,6 +140,7 @@ def main(
     executor: str,
     no_exec: bool,
     time_limit: int | None,
+    total_budget_seconds: int | None,
     models: tuple[str, ...],
     challenge: str | None,
     challenges_dir: str,
@@ -178,6 +186,8 @@ def main(
     executor_mode = _resolve_executor_mode(settings)
     if time_limit is not None:
         settings.challenge_time_limit_seconds = time_limit
+    if total_budget_seconds is not None:
+        settings.total_benchmark_budget_seconds = total_budget_seconds
 
     if models:
         model_specs = list(models)
@@ -204,6 +214,13 @@ def main(
     console.print(f"  Image: {settings.sandbox_image}" if executor_mode == "docker" else "  Image: (unused in headless mode)")
     console.print(f"  Max challenges: {max_challenges}")
     console.print(f"  Per-challenge time limit: {settings.challenge_time_limit_seconds}s")
+    if settings.total_benchmark_budget_seconds > 0:
+        console.print(
+            f"  Total benchmark budget: {settings.total_benchmark_budget_seconds}s "
+            f"(new challenges stop spawning with <{settings.min_remaining_seconds_to_spawn}s left)"
+        )
+    else:
+        console.print("  Total benchmark budget: untracked (per-challenge limits only)")
     console.print(f"  Dashboard: {dashboard_host}:{dashboard_port}" if dashboard_port > 0 else "  Dashboard: disabled")
     if settings.glm_api_key:
         console.print(f"  GLM API Key: configured ({settings.glm_model_id} @ {settings.glm_base_url})")
@@ -217,7 +234,9 @@ def main(
         asyncio.run(_run_model_smoke_test(settings, model_specs))
         return
 
-    if platform == "tsec" and not smoke_test and not asyncio.run(_check_benchmark_vpn(settings.benchmark_url)):
+    if platform == "tsec" and not smoke_test and not asyncio.run(
+        _check_benchmark_vpn(settings.benchmark_url, settings.vpn_health_check_url)
+    ):
         sys.exit(1)
 
     if platform == "tsec" and not smoke_test and not asyncio.run(_check_benchmark_task(settings)):

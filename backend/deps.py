@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -64,10 +65,15 @@ class HeadlessDeps:
     # Progress marker for the hint stall gate: step index of the last confirmed
     # flag, accepted partial credit, or newly received sibling finding.
     last_progress_step: int = 0
-    # Target lock: hosts from the task's connection_info. Non-killchain tasks
-    # hard-block other hosts; killchain tasks allow pivots but warn.
+    # Target lock: hosts from the task's connection_info. Hard-blocks any
+    # other host unless lock_open is True.
     allowed_hosts: frozenset[str] = frozenset()
     scenario: str = ""
+    # Whether the lock may be bypassed for cross-host pivoting. Deliberately
+    # a separate, stricter field from `scenario` — see
+    # backend.prompts._killchain_lock_open for why a free-text scenario guess
+    # alone must never be sufficient to open the lock.
+    lock_open: bool = False
 
 
 @dataclass
@@ -82,6 +88,10 @@ class CoordinatorDeps:
     max_concurrent_challenges: int = 10
     challenge_time_limit_seconds: int = 1800
     target_lock_timeout_seconds: int = 120
+    # Wall-clock start of this coordinator run — used together with
+    # settings.total_benchmark_budget_seconds to know how much of the WHOLE
+    # run is left, not just the current challenge's own budget.
+    run_started_monotonic: float = field(default_factory=time.monotonic)
 
     msg_port: int = 0  # 0 = auto-pick free port
     dashboard_host: str = "127.0.0.1"

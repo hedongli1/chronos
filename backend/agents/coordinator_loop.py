@@ -18,6 +18,49 @@ from backend.prompts import ChallengeMeta
 
 logger = logging.getLogger(__name__)
 
+
+def remaining_global_seconds(deps: CoordinatorDeps) -> float | None:
+    """Seconds left in the whole benchmark run, or None if untracked.
+
+    None (the default, total_benchmark_budget_seconds=0) preserves the old
+    behavior exactly: every per-challenge decision is made independently with
+    no notion of a run-wide deadline. When a budget IS configured, callers
+    use this to avoid starting work that cannot realistically finish before
+    the platform's own cutoff forces it closed anyway.
+    """
+    import time as _time
+
+    budget = int(getattr(deps.settings, "total_benchmark_budget_seconds", 0) or 0)
+    if budget <= 0:
+        return None
+    elapsed = _time.monotonic() - deps.run_started_monotonic
+    return max(0.0, budget - elapsed)
+
+
+def _challenge_priority_key(name: str, stubs: dict[str, dict]) -> tuple[float, float, str]:
+    """Sort key for the auto-spawn candidate queue.
+
+    Highest score first, then easiest (lowest `level`) first, falling back to
+    the name for determinism when both are equal or unknown. This replaces a
+    plain alphabetical sort, which ignored point value entirely — across a
+    title with dozens of unevenly-scored tasks sharing one wall-clock budget,
+    working through them in name order has no relationship to maximizing
+    total score, and the coordinator's own system prompt already claims
+    "prioritizing by solve count (easy first)" that the code never actually
+    implemented.
+    """
+    stub = stubs.get(name) or {}
+
+    def _as_float(v: Any, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    value = _as_float(stub.get("value"))
+    level = _as_float(stub.get("level"))
+    return (-value, level, name)
+
 # Callable type for a coordinator turn: (message) -> None
 TurnFn = Callable[[str], Coroutine[Any, Any, None]]
 
@@ -170,10 +213,13 @@ async def run_event_loop(
         print(console_msg)
 
     unsolved = poller.known_challenges - poller.known_solved
+    unsolved_by_priority = sorted(
+        unsolved, key=lambda name: _challenge_priority_key(name, poller.known_stubs)
+    )
     initial_msg = (
         f"Benchmark is LIVE. {len(poller.known_challenges)} targets, "
         f"{len(poller.known_solved)} solved.\n"
-        f"Unsolved: {sorted(unsolved) if unsolved else 'NONE'}\n"
+        f"Unsolved (highest score, easiest first): {unsolved_by_priority or 'NONE'}\n"
         f"Each challenge has a hard {deps.challenge_time_limit_seconds}s wall-clock budget. "
         "Fetch challenges and spawn swarms for unsolved, non-deferred challenges."
     )
@@ -345,11 +391,17 @@ async def run_event_loop(
                 preparing = sorted(deps.pending_spawns)
                 solved_set = poller.known_solved
                 unsolved_set = poller.known_challenges - solved_set
+                budget_left = remaining_global_seconds(deps)
+                budget_note = (
+                    f" Budget left: {int(budget_left) // 60}min."
+                    if budget_left is not None
+                    else ""
+                )
                 status_line = (
                     f"STATUS: {len(solved_set)} solved, {len(unsolved_set)} unsolved, "
                     f"{len(active)} active swarms, {len(preparing)} preparing, "
                     f"{len(deps.deferred_challenges)} deferred. "
-                    f"Cost: ${cost_tracker.total_cost_usd:.2f}"
+                    f"Cost: ${cost_tracker.total_cost_usd:.2f}{budget_note}"
                 )
                 deadlock = (
                     not active
@@ -453,6 +505,21 @@ async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
     )
     if active >= deps.max_concurrent_challenges:
         return
+    remaining = remaining_global_seconds(deps)
+    if remaining is not None:
+        floor = float(getattr(deps.settings, "min_remaining_seconds_to_spawn", 300))
+        if remaining < floor:
+            # Run-wide budget is nearly gone: starting a new container here
+            # has no realistic chance to finish before the platform cuts the
+            # run off anyway, and it would just occupy a slot while already-
+            # active work tries to land. Let what is active finish instead
+            # of starting something new.
+            logger.info(
+                "Skipping spawn of %s: only %.0fs left of the total benchmark "
+                "budget (floor %.0fs)",
+                challenge_name, remaining, floor,
+            )
+            return
     try:
         from backend.agents.coordinator_core import do_spawn_swarm
         result = await do_spawn_swarm(deps, challenge_name)
@@ -471,7 +538,11 @@ async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
 
 
 async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
-    unsolved = sorted(poller.known_challenges - poller.known_solved)
+    stubs = poller.known_stubs
+    unsolved = sorted(
+        poller.known_challenges - poller.known_solved,
+        key=lambda name: _challenge_priority_key(name, stubs),
+    )
     active = (
         sum(1 for t in deps.swarm_tasks.values() if not t.done())
         + len(deps.pending_spawns)

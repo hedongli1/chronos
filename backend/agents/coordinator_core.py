@@ -164,6 +164,7 @@ async def _start_reserved_swarm(deps: CoordinatorDeps, challenge_name: str) -> s
     if deps.challenge_metas[challenge_name].connection_info:
         deps.open_containers.add(challenge_name)
 
+    from backend.agents.coordinator_loop import remaining_global_seconds
     from backend.agents.swarm import ChallengeSwarm
 
     swarm = ChallengeSwarm(
@@ -175,6 +176,7 @@ async def _start_reserved_swarm(deps: CoordinatorDeps, challenge_name: str) -> s
         model_specs=deps.model_specs,
         no_submit=deps.no_submit,
         coordinator_inbox=deps.coordinator_inbox,
+        remaining_global_seconds=remaining_global_seconds(deps),
     )
     async def _run_and_cleanup() -> None:
         result = await _run_swarm_with_time_limit(deps, challenge_name, swarm)
@@ -212,9 +214,14 @@ async def _start_reserved_swarm(deps: CoordinatorDeps, challenge_name: str) -> s
 
 async def _run_swarm_with_time_limit(deps: CoordinatorDeps, challenge_name: str, swarm):
     """Run one swarm with the configured wall-clock budget."""
+    from backend.agents.coordinator_loop import remaining_global_seconds
     from backend.agents.swarm import _time_limit_for_challenge
 
-    limit = _time_limit_for_challenge(deps.settings, deps.challenge_metas.get(challenge_name))
+    limit = _time_limit_for_challenge(
+        deps.settings,
+        deps.challenge_metas.get(challenge_name),
+        remaining_global_seconds(deps),
+    )
     # asyncio.wait (unlike wait_for) never cancels the swarm task on timeout, so
     # kill() records the cancel reason BEFORE solvers write their finish events.
     run_task = asyncio.create_task(swarm.run(), name=f"swarm-run-{challenge_name}")

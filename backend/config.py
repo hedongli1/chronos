@@ -104,6 +104,25 @@ class Settings(BaseSettings):
             "TSECBENCH_CHALLENGE_TIME_LIMIT_SECONDS",
         ),
     )
+    # Total wall-clock budget for the whole benchmark run (e.g. Tsecbench v1's
+    # published 360-minute window = 21600). 0 disables tracking entirely
+    # (back-compat default — per-challenge limits behave exactly as before).
+    # When set, the scheduler clamps each new challenge's time limit to what
+    # is actually left of the run, and stops opening new challenges once the
+    # remaining budget can no longer realistically finish one — otherwise the
+    # system has no way to notice it is scheduled to run past the platform's
+    # own cutoff and gets its containers force-closed mid-attempt for free.
+    total_benchmark_budget_seconds: int = Field(
+        default=0,
+        validation_alias=AliasChoices("TOTAL_BENCHMARK_BUDGET_SECONDS"),
+    )
+    # Below this many remaining seconds in the total budget, stop opening new
+    # challenges (finish what is running, but do not start something that has
+    # no realistic chance to complete before the platform cuts the run off).
+    min_remaining_seconds_to_spawn: int = Field(
+        default=300,
+        validation_alias=AliasChoices("MIN_REMAINING_SECONDS_TO_SPAWN"),
+    )
     solver_retry_delay_seconds: float = Field(
         default=2.0,
         validation_alias=AliasChoices("SOLVER_RETRY_DELAY_SECONDS"),
@@ -145,5 +164,13 @@ class Settings(BaseSettings):
     )
     dashboard_host: str = Field(default="127.0.0.1", validation_alias=AliasChoices("DASHBOARD_HOST", "TSECBENCH_DASHBOARD_HOST"))
     dashboard_port: int = Field(default=0, validation_alias=AliasChoices("DASHBOARD_PORT", "TSECBENCH_DASHBOARD_PORT"))
+
+    # VPN-only health endpoint probed before any benchmark run starts. Kept
+    # configurable (rather than hardcoded in cli.py) because the platform can
+    # change which address it uses for this check without needing a code change.
+    vpn_health_check_url: str = Field(
+        default="http://10.0.100.58",
+        validation_alias=AliasChoices("VPN_HEALTH_CHECK_URL"),
+    )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
