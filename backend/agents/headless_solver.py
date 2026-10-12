@@ -492,14 +492,13 @@ class HeadlessSolver:
             self.deps, self.tracer, self._step_count, time.monotonic(), self._hint_gate,
         )
 
-        from backend.agents.solver import TracingToolset
+        from backend.agents.tracing_toolset import TracingToolset
 
         toolset = TracingToolset(
             wrapped=raw_toolset,
             tracer=self.tracer,
             loop_detector=self.loop_detector,
             step_counter=self._step_count,
-            checkpoint_callback=None,  # no workspace to persist; checkpointing stays trace-based
         )
 
         self._agent = Agent(

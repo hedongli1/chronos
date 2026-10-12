@@ -259,16 +259,9 @@ async def _run_single(
 ) -> None:
     """Run a single challenge with a swarm."""
     from backend.agents.coordinator_loop import _create_platform
-    from backend.agents.swarm import ChallengeSwarm, _resolve_executor_mode
+    from backend.agents.swarm import ChallengeSwarm
     from backend.cost_tracker import CostTracker
     from backend.prompts import ChallengeMeta
-
-    if _resolve_executor_mode(settings) == "docker":
-        from backend.sandbox import cleanup_orphan_containers, configure_semaphore
-
-        max_containers = max_challenges * len(model_specs)
-        configure_semaphore(max_containers)
-        await cleanup_orphan_containers()
 
     platform = _create_platform(settings)
     cost_tracker = CostTracker()

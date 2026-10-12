@@ -139,17 +139,14 @@ def build_deps(
 
 
 def _create_platform(settings: Settings) -> CompetitionPlatform:
-    """Create the appropriate platform adapter based on settings."""
-    mode = getattr(settings, "platform_mode", "auto")
-    if mode == "local":
-        from backend.local_platform import LocalPlatform
-        return LocalPlatform(challenges_root="challenges")
+    """Create the TSecBench platform adapter."""
+    mode = getattr(settings, "platform_mode", "tsec")
     if mode in ("tsec", "tsecbench", "benchmark"):
         from backend.tsec_platform import TSecBenchmarkPlatform
         base = settings.platform_url or settings.benchmark_url
         token = settings.platform_token or settings.benchmark_token
         return TSecBenchmarkPlatform(base_url=base, token=token)
-    raise ValueError(f"Unknown platform mode: {mode!r} (expected 'tsec' or 'local')")
+    raise ValueError(f"Unknown platform mode: {mode!r} (expected 'tsec')")
 
 
 async def run_event_loop(
