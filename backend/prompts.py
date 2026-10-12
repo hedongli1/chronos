@@ -60,11 +60,9 @@ class ChallengeMeta:
 def _guess_scenario(meta: ChallengeMeta) -> str:
     """Infer the offensive-security dimension from code/name/category signals.
 
-    NOTE: this is a free-text keyword heuristic over name/description — it is
-    appropriate for picking which playbook text to show (low stakes, wrong
-    guess just shows a slightly less relevant playbook), but it must NOT be
-    used on its own to decide whether the target lock is disabled. See
-    `_killchain_lock_open` below for the safety-relevant check.
+    A free-text keyword heuristic, used ONLY to pick a per-challenge time
+    budget (killchain tasks get longer). It never shapes the prompt text and
+    never affects the target lock, which is purely structural.
     """
     blob = f"{meta.unique_code} {meta.name} {meta.category} {meta.description}".lower()
     for key in ("killchain", "evasion", "exploit", "cloud", "binary", "web"):
@@ -85,26 +83,6 @@ def _guess_scenario(meta: ChallengeMeta) -> str:
         if word in blob:
             return key
     return "web"
-
-
-def _killchain_lock_open(meta: ChallengeMeta, allowed_hosts: frozenset[str]) -> bool:
-    """Decide whether the target lock may be disabled for cross-host pivoting.
-
-    This is deliberately STRICTER than `_guess_scenario`: a single mis-tagged
-    word in a task's name/description must never be able to turn off the lock
-    on its own (that was the c-03 incident — a non-killchain task misdetected
-    as killchain ran unlocked on the shared VPN). We only open the lock when
-    BOTH hold:
-      1. The free-text heuristic guesses "killchain", AND
-      2. The task's OWN connection_info already structurally announces more
-         than one host at start — i.e. there is something real to pivot
-         between. A genuine multi-stage task legitimately starts this way;
-         a single-host task has nothing to gain from an open lock, so if the
-         keyword guess is wrong there, it is also harmless (nowhere to drift).
-    """
-    if _guess_scenario(meta) != "killchain":
-        return False
-    return len(allowed_hosts) >= 2
 
 
 def build_headless_prompt(

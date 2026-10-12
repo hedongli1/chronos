@@ -34,7 +34,6 @@ from backend.platforms import CompetitionPlatform
 from backend.prompts import (
     ChallengeMeta,
     _guess_scenario,
-    _killchain_lock_open,
     build_headless_prompt,
 )
 from backend.solver_base import CANCELLED, ERROR, FLAG_FOUND, GAVE_UP, SolverResult
@@ -102,20 +101,17 @@ def _parse_allowed_hosts(connection_info: str) -> frozenset[str]:
 def _target_lock_block(deps: HeadlessDeps, host: str) -> str | None:
     """Return a block message when host is outside the assigned targets, else None.
 
-    Killchain (multi-stage) tasks legitimately pivot to newly discovered hosts,
-    so the lock only applies to single-target scenarios — playbook discipline
-    covers the rest. Whether a task qualifies for this bypass is decided once,
-    structurally, at construction time (`deps.lock_open` — see
-    `backend.prompts._killchain_lock_open`), NOT by re-guessing the scenario
-    from free text here.
+    Purely structural: the solver's own egress is always restricted to the hosts
+    parsed from this task's connection_info — no scenario/keyword guess can open
+    it. This does not hinder multi-stage tasks: legitimate pivoting to internal
+    hosts happens through a compromised host's own shell/RCE, not the solver's
+    direct http_request/tcp_send/run_python sockets.
 
     Fail-loud: an empty allowed-hosts set must NOT silently disable the lock
     (the c-03 incident: unresolved connection_info let a run drift onto three
     other teams' instances). With no known target, ALL egress is refused and
     the model is told how to obtain/confirm the target.
     """
-    if deps.lock_open:
-        return None
     if not deps.allowed_hosts:
         return (
             "BLOCKED (target lock — NO TARGET KNOWN): this task's connection info "
@@ -207,14 +203,13 @@ def _build_toolset(
         """
         if not ctx.deps.allow_exec:
             return "run_python is disabled for this run (--no-exec)."
-        # Pass the allowed-hosts set through even when empty: do_run_python
-        # treats None as "no lock" and an empty set as the degraded
-        # no-target-known lock (localhost only).
-        allowed = None if ctx.deps.lock_open else ctx.deps.allowed_hosts
+        # Always pass the allowed-hosts set (even when empty): do_run_python
+        # treats an empty set as the degraded no-target-known lock (localhost
+        # only). The solver's own sockets are always restricted to scope.
         return await do_run_python(
             code,
             timeout=timeout,
-            allowed_hosts=allowed,
+            allowed_hosts=ctx.deps.allowed_hosts,
             workdir=ctx.deps.workdir or None,
         )
 
@@ -365,10 +360,6 @@ class HeadlessSolver:
             deadline_monotonic=time.monotonic() + time_budget_seconds,
             allowed_hosts=parsed_hosts,
             scenario=_guess_scenario(meta),
-            # Structural + heuristic gate — see _killchain_lock_open docstring.
-            # A single mis-tagged keyword can no longer open the lock on its
-            # own; the task must also announce >=2 hosts up front.
-            lock_open=_killchain_lock_open(meta, parsed_hosts),
         )
         self.loop_detector = LoopDetector()
         self.tracer = SolverTracer(meta.name, self.model_id)
@@ -397,7 +388,7 @@ class HeadlessSolver:
             remaining_seconds=remaining,
             allow_exec=self.allow_exec,
         )
-        if not self.deps.lock_open and not self.deps.allowed_hosts:
+        if not self.deps.allowed_hosts:
             # Degraded target lock: no target hosts could be parsed from
             # connection_info, so the lock refuses ALL egress instead of
             # silently running unlocked. Make it loud in both trace and prompt.

@@ -47,15 +47,11 @@ class HeadlessDeps:
     # Progress marker for the hint stall gate: step index of the last confirmed
     # flag, accepted partial credit, or newly received sibling finding.
     last_progress_step: int = 0
-    # Target lock: hosts from the task's connection_info. Hard-blocks any
-    # other host unless lock_open is True.
+    # Target lock: hosts parsed from the task's connection_info. The solver's
+    # own egress is always restricted to these (empty = degraded, localhost
+    # only). There is no bypass — purely structural.
     allowed_hosts: frozenset[str] = frozenset()
     scenario: str = ""
-    # Whether the lock may be bypassed for cross-host pivoting. Deliberately
-    # a separate, stricter field from `scenario` — see
-    # backend.prompts._killchain_lock_open for why a free-text scenario guess
-    # alone must never be sufficient to open the lock.
-    lock_open: bool = False
 
 
 @dataclass
