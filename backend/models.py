@@ -1,0 +1,264 @@
+"""Model resolution — Bedrock, Azure OpenAI, Zen, Google, DeepSeek, Qwen."""
+
+from __future__ import annotations
+
+import itertools
+import logging
+from typing import TYPE_CHECKING
+
+import boto3
+import httpx
+from openai import AsyncOpenAI
+from pydantic_ai.models import Model
+from pydantic_ai.models.bedrock import BedrockConverseModel, BedrockModelSettings
+from pydantic_ai.models.google import GoogleModel, GoogleModelSettings
+from pydantic_ai.models.openai import (
+    OpenAIChatModel,
+    OpenAIChatModelSettings,
+    OpenAIResponsesModel,
+)
+from pydantic_ai.providers.bedrock import BedrockProvider
+from pydantic_ai.providers.google import GoogleProvider
+from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.settings import ModelSettings
+
+if TYPE_CHECKING:
+    from backend.config import Settings
+
+logger = logging.getLogger(__name__)
+
+# Round-robin counter for DeepSeek key rotation (rate-limit relief under
+# concurrent swarms). Process-local is fine: each solver/coordinator resolves
+# its model once at startup.
+_deepseek_rr = itertools.count()
+
+
+def _deepseek_keys(settings: Settings) -> list[str]:
+    keys = [settings.deepseek_api_key] if settings.deepseek_api_key else []
+    extra = getattr(settings, "deepseek_extra_api_keys", "") or ""
+    keys += [k.strip() for k in extra.split(",") if k.strip()]
+    return keys
+
+# Default model spec — single DeepSeek model on the official API.
+# (Pass --models explicitly for any other provider or a multi-model swarm.)
+DEFAULT_MODELS: list[str] = [
+    "deepseek/deepseek-chat",
+]
+
+# Context window sizes (tokens)
+CONTEXT_WINDOWS: dict[str, int] = {
+    "us.anthropic.claude-opus-4-6-v1": 1_000_000,
+    "claude-opus-4-6": 1_000_000,
+    "gpt-5.4": 1_000_000,
+    "gpt-5.4-mini": 400_000,
+    "gpt-5.3-codex": 1_000_000,
+    "gpt-5.3-codex-spark": 128_000,
+    "gemini-3-flash-preview": 1_000_000,
+    "deepseek-chat": 128_000,
+    "deepseek-reasoner": 128_000,
+    "qwen-plus": 1_000_000,
+    "glm-5.3": 200_000,
+}
+
+# Models that support vision
+VISION_MODELS: set[str] = {
+    "us.anthropic.claude-opus-4-6-v1",
+    "claude-opus-4-6",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gemini-3-flash-preview",
+}
+
+
+def resolve_model(spec: str, settings: Settings) -> Model:
+    """Resolve a 'provider/model_id' spec to a Pydantic AI Model."""
+    provider = provider_from_spec(spec)
+    model_id = model_id_from_spec(spec)
+    match provider:
+        case "bedrock":
+            if settings.aws_bearer_token:
+                return BedrockConverseModel(
+                    model_id,
+                    provider=BedrockProvider(
+                        api_key=settings.aws_bearer_token,
+                        region_name=settings.aws_region,
+                    ),
+                )
+            else:
+                session = boto3.Session()
+                client = session.client("bedrock-runtime", region_name=settings.aws_region)
+                return BedrockConverseModel(
+                    model_id,
+                    provider=BedrockProvider(bedrock_client=client),
+                )
+        case "azure":
+            return OpenAIChatModel(
+                model_id,
+                provider=OpenAIProvider(
+                    base_url=settings.azure_openai_endpoint,
+                    api_key=settings.azure_openai_api_key,
+                ),
+            )
+        case "zen":
+            return OpenAIChatModel(
+                model_id,
+                provider=OpenAIProvider(
+                    base_url="https://opencode.ai/zen/v1",
+                    api_key=settings.opencode_zen_api_key,
+                ),
+            )
+        case "google":
+            return GoogleModel(
+                model_id,
+                provider=GoogleProvider(api_key=settings.gemini_api_key),
+            )
+        case "glm":
+            if not settings.glm_api_key:
+                raise ValueError(
+                    "GLM requires GLM_API_KEY (ZHIPU_API_KEY / ZHIPUAI_API_KEY / "
+                    "BIGMODEL_API_KEY are also accepted)."
+                )
+            base_url = (settings.glm_base_url or "").strip().rstrip("/")
+            if not base_url:
+                base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+            return OpenAIChatModel(
+                model_id,
+                provider=OpenAIProvider(
+                    base_url=base_url,
+                    api_key=settings.glm_api_key,
+                ),
+            )
+        case "qwen":
+            if not settings.qwen_api_key:
+                raise ValueError(
+                    "Qwen requires QWEN_API_KEY (DASHSCOPE_API_KEY and "
+                    "BAILIAN_API_KEY are also accepted)."
+                )
+            if not settings.qwen_base_url:
+                raise ValueError("Qwen requires a non-empty QWEN_BASE_URL.")
+
+            raw_url = settings.qwen_base_url.rstrip("/")
+            api_mode = settings.qwen_api_mode.strip().lower()
+            if raw_url.endswith("/responses"):
+                raw_url = raw_url.removesuffix("/responses")
+                api_mode = "responses"
+            elif raw_url.endswith("/chat/completions"):
+                raw_url = raw_url.removesuffix("/chat/completions")
+                api_mode = "chat"
+
+            if api_mode == "responses":
+                return OpenAIResponsesModel(
+                    model_id,
+                    provider=OpenAIProvider(
+                        base_url=raw_url,
+                        api_key=settings.qwen_api_key,
+                    ),
+                )
+            if api_mode != "chat":
+                raise ValueError("QWEN_API_MODE must be either 'responses' or 'chat'.")
+            return OpenAIChatModel(
+                model_id,
+                provider=OpenAIProvider(
+                    base_url=raw_url,
+                    api_key=settings.qwen_api_key,
+                ),
+            )
+        case "deepseek":
+            keys = _deepseek_keys(settings)
+            if not keys:
+                raise ValueError("DeepSeek requires DEEPSEEK_API_KEY.")
+            key_idx = next(_deepseek_rr) % len(keys)
+            if len(keys) > 1:
+                logger.info("DeepSeek model instance using key %d/%d", key_idx + 1, len(keys))
+            # trust_env=False: connect directly, never through a local HTTP
+            # proxy — the VPN tunnel can break proxy routing mid-run, and both
+            # DeepSeek and the benchmark platform are directly reachable.
+            # max_retries raised from the SDK default (2): under swarm
+            # concurrency a 429 burst should back off and recover, not fail
+            # the solver turn.
+            client = AsyncOpenAI(
+                api_key=keys[key_idx],
+                base_url="https://api.deepseek.com/v1",
+                max_retries=6,
+                http_client=httpx.AsyncClient(
+                    trust_env=False,
+                    timeout=httpx.Timeout(connect=30.0, read=300.0, write=120.0, pool=30.0),
+                ),
+            )
+            return OpenAIChatModel(
+                model_id,
+                provider=OpenAIProvider(openai_client=client),
+            )
+        case "claude-sdk" | "codex":
+            raise ValueError(
+                f"Provider '{provider}' uses its own solver backend, not Pydantic AI. "
+                f"resolve_model() should not be called for {spec}."
+            )
+        case _:
+            raise ValueError(f"Unknown provider: {provider}")
+
+
+def resolve_model_settings(spec: str) -> ModelSettings:
+    """Get provider-specific model settings with caching enabled."""
+    provider = spec.split("/", 1)[0]
+    match provider:
+        case "bedrock":
+            return BedrockModelSettings(
+                max_tokens=128_000,
+                bedrock_cache_instructions=True,
+                bedrock_cache_tool_definitions=True,
+                bedrock_cache_messages=True,
+            )
+        case "azure" | "zen" | "deepseek":
+            # OpenAI-compatible chat endpoints use server-side prompt caching
+            # automatically; cap output tokens to avoid reserving the full context.
+            return OpenAIChatModelSettings(
+                max_tokens=128_000,
+            )
+        case "glm":
+            # GLM-5.x thinking models can spend a lot of tokens on reasoning;
+            # 32K output keeps long tool conversations accepted on the plan.
+            return OpenAIChatModelSettings(max_tokens=32_768)
+        case "qwen":
+            # qwen-plus supports up to 32K output tokens. Keep the provider
+            # limit explicit so long-running tool conversations are accepted.
+            return OpenAIChatModelSettings(max_tokens=32_768)
+        case "google":
+            return GoogleModelSettings(
+                max_tokens=64_000,
+                google_thinking_config={
+                    "thinking_level": "high",
+                    "include_thoughts": True,
+                },
+            )
+        case _:
+            return ModelSettings(max_tokens=128_000)
+
+
+def model_id_from_spec(spec: str) -> str:
+    """Extract just the model ID from a spec (strips effort suffix)."""
+    parts = spec.split("/")
+    return parts[1] if len(parts) >= 2 else spec
+
+
+def provider_from_spec(spec: str) -> str:
+    """Extract the provider from a spec."""
+    return spec.split("/", 1)[0]
+
+
+def effort_from_spec(spec: str) -> str | None:
+    """Extract effort level from a spec like 'claude-sdk/claude-opus-4-6/max'."""
+    parts = spec.split("/")
+    if len(parts) >= 3 and parts[2] in ("low", "medium", "high", "max"):
+        return parts[2]
+    return None
+
+
+def supports_vision(spec: str) -> bool:
+    """Check if a model spec supports vision."""
+    return model_id_from_spec(spec) in VISION_MODELS
+
+
+def context_window(spec: str) -> int:
+    """Get context window size for a model spec."""
+    return CONTEXT_WINDOWS.get(model_id_from_spec(spec), 200_000)
