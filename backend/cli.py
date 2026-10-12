@@ -116,7 +116,7 @@ async def _check_benchmark_task(settings: Settings) -> bool:
 @click.option(
     "--coordinator",
     default="deepseek",
-    type=click.Choice(["claude", "codex", "deepseek", "qwen", "glm"]),
+    type=click.Choice(["deepseek", "qwen", "glm"]),
     help="Coordinator backend (default: deepseek)",
 )
 @click.option(
@@ -378,39 +378,20 @@ async def _run_coordinator(
         mode_label += " + REPL"
     console.print(f"[bold]Starting coordinator ({mode_label}, Ctrl+C to stop)...[/bold]\n")
 
-    if coordinator_backend == "codex":
-        from backend.agents.codex_coordinator import run_codex_coordinator
-        results = await run_codex_coordinator(
-            settings=settings,
-            model_specs=model_specs,
-            challenges_root=challenges_dir,
-            no_submit=no_submit,
-            coordinator_model=coordinator_model,
-        )
-    elif coordinator_backend in ("deepseek", "qwen", "glm"):
-        from backend.agents.pydantic_coordinator import run_pydantic_coordinator
-        if coordinator_model is None:
-            if coordinator_backend == "qwen":
-                coordinator_model = "qwen/qwen-plus"
-            elif coordinator_backend == "glm":
-                coordinator_model = f"glm/{settings.glm_model_id}"
-        results = await run_pydantic_coordinator(
-            settings=settings,
-            model_specs=model_specs,
-            challenges_root=challenges_dir,
-            no_submit=no_submit,
-            coordinator_model=coordinator_model,
-            interactive=interactive,
-        )
-    else:
-        from backend.agents.claude_coordinator import run_claude_coordinator
-        results = await run_claude_coordinator(
-            settings=settings,
-            model_specs=model_specs,
-            challenges_root=challenges_dir,
-            no_submit=no_submit,
-            coordinator_model=coordinator_model,
-        )
+    from backend.agents.pydantic_coordinator import run_pydantic_coordinator
+    if coordinator_model is None:
+        if coordinator_backend == "qwen":
+            coordinator_model = "qwen/qwen-plus"
+        elif coordinator_backend == "glm":
+            coordinator_model = f"glm/{settings.glm_model_id}"
+    results = await run_pydantic_coordinator(
+        settings=settings,
+        model_specs=model_specs,
+        challenges_root=challenges_dir,
+        no_submit=no_submit,
+        coordinator_model=coordinator_model,
+        interactive=interactive,
+    )
 
     console.print("\n[bold]Final Results:[/bold]")
     for challenge, data in results.get("results", {}).items():

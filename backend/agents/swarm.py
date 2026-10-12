@@ -285,42 +285,6 @@ class ChallengeSwarm:
                 workdir=workspace_dir,
             )
 
-        if provider == "claude-sdk":
-            from backend.agents.claude_solver import ClaudeSolver
-            return ClaudeSolver(
-                model_spec=model_spec,
-                challenge_dir=self.challenge_dir,
-                meta=self.meta,
-                platform=self.platform,
-                cost_tracker=self.cost_tracker,
-                settings=self.settings,
-                cancel_event=self.cancel_event,
-                no_submit=self.no_submit,
-                submit_fn=_submit_fn,
-                message_bus=self.message_bus,
-                notify_coordinator=_notify,
-                persistent_workspace_dir=workspace_dir,
-                resume_context=resume_context,
-            )
-
-        if provider == "codex":
-            from backend.agents.codex_solver import CodexSolver
-            return CodexSolver(
-                model_spec=model_spec,
-                challenge_dir=self.challenge_dir,
-                meta=self.meta,
-                platform=self.platform,
-                cost_tracker=self.cost_tracker,
-                settings=self.settings,
-                cancel_event=self.cancel_event,
-                no_submit=self.no_submit,
-                submit_fn=_submit_fn,
-                message_bus=self.message_bus,
-                notify_coordinator=_notify,
-                persistent_workspace_dir=workspace_dir,
-                resume_context=resume_context,
-            )
-
         return self._create_pydantic_solver(
             model_spec,
             state_model_spec=model_spec,
