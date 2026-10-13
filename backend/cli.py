@@ -109,6 +109,9 @@ async def _check_benchmark_task(settings: Settings) -> bool:
     help="Concurrent range-container window (hard cap 3)",
 )
 @click.option("-i", "--interactive", is_flag=True, help="Enable interactive REPL (type messages in terminal)")
+@click.option("--web", is_flag=True, help="Launch the web console (live visualization + operator control + solver watch/talk)")
+@click.option("--web-host", default="127.0.0.1", help="Web console host (default: 127.0.0.1)")
+@click.option("--web-port", default=8000, type=int, help="Web console port (default: 8000)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 def main(
     platform_url: str | None,
@@ -127,6 +130,9 @@ def main(
     model_smoke_test: bool,
     max_challenges: int,
     interactive: bool,
+    web: bool,
+    web_host: str,
+    web_port: int,
     verbose: bool,
 ) -> None:
     """Offensive-security agent — TSecBench headless solver swarm with a mechanical scheduler.
@@ -211,6 +217,20 @@ def main(
         asyncio.run(_run_tsec_smoke_test(settings))
     elif challenge:
         asyncio.run(_run_single(settings, challenge, model_specs, no_submit, max_challenges, challenges_dir))
+    elif web:
+        console.print(f"[bold]Web console → http://{web_host}:{web_port}[/bold] (Ctrl+C to stop)\n")
+        from backend.web import run_web_scheduler
+
+        asyncio.run(
+            run_web_scheduler(
+                settings,
+                model_specs=model_specs,
+                challenges_root=challenges_dir,
+                no_submit=no_submit,
+                host=web_host,
+                port=web_port,
+            )
+        )
     else:
         asyncio.run(
             _run_coordinator(

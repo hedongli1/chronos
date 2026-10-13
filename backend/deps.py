@@ -68,6 +68,9 @@ class CoordinatorDeps:
     # settings.total_benchmark_budget_seconds to know how much of the WHOLE
     # run is left, not just the current challenge's own budget.
     run_started_monotonic: float = field(default_factory=time.monotonic)
+    # Set by run_event_loop so an embedded web console can read challenge /
+    # solved / score state without a second platform client. None outside a run.
+    poller: Any = None
 
     # Runtime state
     coordinator_inbox: asyncio.Queue = field(default_factory=asyncio.Queue)

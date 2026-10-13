@@ -170,6 +170,7 @@ async def run_event_loop(
         jitter_s=(poll_max - poll_min) / 2,
     )
     await poller.start()
+    deps.poller = poller  # let an embedded web console read challenge/score state
 
     logger.info(
         "Scheduler starting: %d model(s), %d challenges, %d solved",
@@ -201,7 +202,8 @@ async def run_event_loop(
 
         while True:
             events = []
-            evt = await poller.get_event(timeout=5.0)
+            # 1s (not 5s) so operator/web commands apply promptly.
+            evt = await poller.get_event(timeout=1.0)
             if evt:
                 events.append(evt)
             events.extend(poller.drain_events())
@@ -275,6 +277,9 @@ async def run_event_loop(
                     continue
                 if op_msg.startswith("__kill__"):
                     await _handle_kill(deps, op_msg[len("__kill__"):])
+                    continue
+                if op_msg.startswith("__bump__"):
+                    _handle_bump(deps, op_msg[len("__bump__"):])
                     continue
 
             # Periodic refill + status + deadlock auto-resume.
@@ -395,6 +400,30 @@ async def _handle_kill(deps: CoordinatorDeps, challenge_name: str) -> None:
         deps.deferred_challenges[challenge_name] = "stopped by operator"
         deps.pending_spawns.discard(challenge_name)
         print(f"  Deferred (was not running): {challenge_name}")
+
+
+def _handle_bump(deps: CoordinatorDeps, payload: str) -> None:
+    """Inject an operator message into one running solver (the web console's
+    'talk to the agent'). Payload is JSON: {challenge, model, message}."""
+    import json
+
+    try:
+        data = json.loads(payload)
+        challenge = data["challenge"]
+        model = data["model"]
+        message = str(data.get("message", "")).strip()
+    except (ValueError, KeyError, TypeError) as e:
+        logger.warning("Bad __bump__ payload: %s (%s)", payload[:120], e)
+        return
+    if not message:
+        return
+    swarm = deps.swarms.get(challenge)
+    solver = swarm.solvers.get(model) if swarm else None
+    if not solver:
+        logger.warning("Bump: no live solver %s / %s", challenge, model)
+        return
+    solver.bump(f"[Operator guidance] {message}")
+    logger.info("Operator bumped %s / %s", challenge, model)
 
 
 def _log_status_and_handle_deadlock(

@@ -96,6 +96,22 @@ uv run ctf-solve --smoke-test         # 平台连通性（题目列表 + 已解�
 uv run ctf-solve --model-smoke-test   # 大模型 API 连通性
 ```
 
+### Web 控制台（可视化 + 与 solver 对话）
+
+```bash
+uv run ctf-solve --web                 # 默认 http://127.0.0.1:8000
+uv run ctf-solve --web --web-port 9000
+```
+
+内嵌 FastAPI + WebSocket 服务,机械调度器在后台正常跑分,浏览器里实时看到:
+
+- **汇总**:已解 / 未解 / 活跃 / deferred / 成本 / 剩余全局预算
+- **题目网格**:按状态着色,带分值 / 难度 / 多 flag 进度,可按状态筛选
+- **Solver 面板**:选中某题看每个 solver 的实时状态、步数、成本、进度条;可**暂停 / 恢复 / 终止**该题
+- **Solver 控制台**:点某个 solver 的 "Watch",实时流式显示它的推理轨迹(工具调用 / 结果 / flag / usage);底部输入框可**向该 solver 发送一条提示**——这就是"与 Agent 对话",即把一条操作员 guidance 以 bump 的形式注入正在解题的 solver
+
+它是纯**观测 + 操控层**:调度器与 solver 代码零改动(状态靠读共享状态、轨迹靠 tail JSONL、命令走与 REPL 相同的 operator 通道)。调度器本身是机械的,不接自然语言,所以"对话"的对象是**正在思考的 solver**,不是调度器。
+
 ## 核心机制
 
 ### 机械调度器
@@ -145,6 +161,8 @@ uv run ctf-solve [OPTIONS]
 --no-submit                 干跑，不提交 flag
 --no-exec                   禁用 run_python
 --smoke-test / --model-smoke-test
+--web                       启动 Web 控制台（可视化 + 操控 + 盯 solver / 对话）
+--web-host / --web-port     Web 控制台监听地址（默认 127.0.0.1:8000）
 -i                          交互式 REPL
 -v                          详细日志
 ```
@@ -152,6 +170,7 @@ uv run ctf-solve [OPTIONS]
 ## 目录结构
 
 - `backend/`：机械调度器、headless solver、TSecBench 平台适配器、中性工具
+- `backend/web.py` + `backend/webui/`：Web 控制台（FastAPI 服务 + 单页前端）
 - `challenges/`：拉取后的题目元数据
 - `logs/`：trace 日志与运行记录
 - `.ctf-state/`：run_python 的 per-run 工作区

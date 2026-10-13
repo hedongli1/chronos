@@ -11,6 +11,8 @@ dependencies = [
     "pyyaml",
     "rich",
     "click",
+    "fastapi",
+    "uvicorn[standard]",
 ]
 
 [project.scripts]

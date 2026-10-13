@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chronos console</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #121722; --panel2: #0f141d; --line: #1f2733;
+    --fg: #d7dee9; --muted: #7c8899; --accent: #5db0ff; --accent2: #8b7dff;
+    --ok: #4bd08b; --warn: #e2b23b; --bad: #f2616b; --active: #5db0ff; --idle: #4a5568;
+    --mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg); font-family: var(--sans);
+    font-size: 13px; display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 18px; padding: 10px 16px;
+    border-bottom: 1px solid var(--line); background: var(--panel);
+    flex-wrap: wrap;
+  }
+  header .brand { font-weight: 700; letter-spacing: .3px; font-size: 15px; }
+  header .brand span { color: var(--accent); }
+  .stat { display: flex; flex-direction: column; line-height: 1.15; }
+  .stat b { font-size: 15px; font-variant-numeric: tabular-nums; }
+  .stat small { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
+  .conn { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--idle); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .dot.off { background: var(--bad); }
+
+  main { flex: 1; display: grid; grid-template-columns: 1.1fr 1fr 1.2fr; min-height: 0; }
+  .col { min-height: 0; display: flex; flex-direction: column; border-right: 1px solid var(--line); }
+  .col:last-child { border-right: none; }
+  .col h2 {
+    margin: 0; padding: 9px 14px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .8px; color: var(--muted); border-bottom: 1px solid var(--line);
+    background: var(--panel2); position: sticky; top: 0; display: flex; justify-content: space-between;
+  }
+  .scroll { overflow-y: auto; padding: 8px; flex: 1; }
+
+  /* challenge list */
+  .chal {
+    display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: center;
+    padding: 7px 10px; border-radius: 7px; cursor: pointer; border: 1px solid transparent;
+  }
+  .chal:hover { background: #151b26; }
+  .chal.sel { border-color: var(--accent); background: #15202e; }
+  .chal .nm { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chal .meta { grid-column: 1; color: var(--muted); font-size: 11px; }
+  .pill {
+    font-size: 10px; padding: 2px 7px; border-radius: 20px; text-transform: uppercase;
+    letter-spacing: .4px; font-weight: 700; white-space: nowrap;
+  }
+  .pill.solved { background: rgba(75,208,139,.15); color: var(--ok); }
+  .pill.active { background: rgba(93,176,255,.15); color: var(--active); }
+  .pill.preparing { background: rgba(226,178,59,.15); color: var(--warn); }
+  .pill.deferred { background: rgba(242,97,107,.13); color: var(--bad); }
+  .pill.unsolved { background: #1a212c; color: var(--muted); }
+
+  .filterbar { display: flex; gap: 6px; padding: 6px 8px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .filterbar button {
+    background: #141a24; color: var(--muted); border: 1px solid var(--line);
+    border-radius: 6px; padding: 3px 9px; cursor: pointer; font-size: 11px;
+  }
+  .filterbar button.on { color: var(--fg); border-color: var(--accent); }
+
+  /* solver cards */
+  .empty { color: var(--muted); padding: 24px 14px; text-align: center; }
+  .ctrlrow { display: flex; gap: 6px; padding: 8px; border-bottom: 1px solid var(--line); flex-wrap: wrap; align-items: center; }
+  .ctrlrow .title { font-weight: 700; margin-right: auto; }
+  button.act {
+    background: #18202c; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 12px;
+  }
+  button.act:hover { border-color: var(--accent); }
+  button.act.danger:hover { border-color: var(--bad); color: var(--bad); }
+
+  .solver { border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; margin-bottom: 8px; background: var(--panel2); }
+  .solver.watch { border-color: var(--accent2); }
+  .solver .row1 { display: flex; align-items: center; gap: 8px; }
+  .solver .model { font-family: var(--mono); font-weight: 600; }
+  .solver .st { font-size: 11px; color: var(--muted); margin-left: auto; }
+  .solver .st.running { color: var(--active); }
+  .solver .st.won { color: var(--ok); }
+  .bar { height: 5px; background: #0c1119; border-radius: 4px; overflow: hidden; margin-top: 8px; }
+  .bar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); }
+  .solver .sub { display: flex; gap: 12px; color: var(--muted); font-size: 11px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .solver .finding { margin-top: 6px; font-size: 11px; color: #9fb0c4; max-height: 44px; overflow: hidden; }
+  .solver .watchbtn { font-size: 11px; padding: 2px 8px; }
+
+  /* trace / console */
+  .tracehead { display: flex; align-items: center; gap: 8px; padding: 8px; border-bottom: 1px solid var(--line); }
+  .tracehead .who { font-family: var(--mono); color: var(--accent2); font-weight: 600; }
+  #trace { flex: 1; overflow-y: auto; padding: 8px 10px; font-family: var(--mono); font-size: 11.5px; line-height: 1.5; }
+  .ev { padding: 2px 0; border-bottom: 1px solid #10151e; white-space: pre-wrap; word-break: break-word; }
+  .ev .tag { display: inline-block; min-width: 54px; color: var(--muted); }
+  .ev.call .tag { color: var(--accent); }
+  .ev.result .tag { color: var(--ok); }
+  .ev.flag { color: var(--ok); font-weight: 700; }
+  .ev.err { color: var(--bad); }
+  .ev.meta { color: var(--muted); }
+  .ev .step { color: #4a5568; }
+  .talk { display: flex; gap: 6px; padding: 8px; border-top: 1px solid var(--line); }
+  .talk input {
+    flex: 1; background: #0c1119; border: 1px solid var(--line); border-radius: 7px;
+    color: var(--fg); padding: 8px 10px; font-family: var(--sans); font-size: 12px;
+  }
+  .talk input:focus { outline: none; border-color: var(--accent2); }
+  .talk button {
+    background: var(--accent2); color: #0b0e14; border: none; border-radius: 7px;
+    padding: 8px 14px; font-weight: 700; cursor: pointer;
+  }
+  .talk button:disabled { opacity: .4; cursor: not-allowed; }
+  .hint { color: var(--muted); font-size: 10.5px; padding: 0 8px 8px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">chronos<span>·</span>console</div>
+  <div class="stat"><b id="s-solved">0</b><small>solved</small></div>
+  <div class="stat"><b id="s-unsolved">0</b><small>unsolved</small></div>
+  <div class="stat"><b id="s-active">0</b><small>active</small></div>
+  <div class="stat"><b id="s-deferred">0</b><small>deferred</small></div>
+  <div class="stat"><b id="s-cost">$0</b><small>cost</small></div>
+  <div class="stat"><b id="s-budget">—</b><small>budget left</small></div>
+  <div class="conn"><span id="dot" class="dot"></span><span id="conn">connecting…</span></div>
+</header>
+
+<main>
+  <!-- challenges -->
+  <section class="col">
+    <h2>Challenges <span id="chal-count"></span></h2>
+    <div class="filterbar" id="filters"></div>
+    <div class="scroll" id="chal-list"></div>
+  </section>
+
+  <!-- solvers of selected challenge -->
+  <section class="col">
+    <h2 id="sel-title">Solvers</h2>
+    <div class="ctrlrow" id="ctrlrow" style="display:none">
+      <span class="title" id="ctrl-name"></span>
+      <button class="act" data-cmd="pause">Pause</button>
+      <button class="act" data-cmd="resume">Resume</button>
+      <button class="act danger" data-cmd="kill">Kill</button>
+    </div>
+    <div class="scroll" id="solver-list"><div class="empty">选择左侧一道正在运行的题目</div></div>
+  </section>
+
+  <!-- solver console -->
+  <section class="col">
+    <h2>Solver Console</h2>
+    <div class="tracehead">
+      <span>盯 solver：</span><span class="who" id="watch-who">未选择</span>
+    </div>
+    <div id="trace"><div class="empty">在中间栏点某个 solver 的 “Watch”，这里实时显示它的推理轨迹</div></div>
+    <div class="talk">
+      <input id="talk-in" placeholder="给这个 solver 发一条提示…（回车发送）" disabled>
+      <button id="talk-send" disabled>发送</button>
+    </div>
+    <div class="hint">“对话” = 向该 solver 注入一条操作员提示（bump）。调度器本身是纯机械的，不接自然语言。</div>
+  </section>
+</main>
+
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  let state = { summary:{}, challenges:[], swarms:{}, deferred:{} };
+  let selected = null;        // selected challenge name
+  let watching = null;        // {challenge, model}
+  let filter = "all";
+  let ws = null;
+
+  // ---------- websocket ----------
+  function connect() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.onopen = () => setConn(true);
+    ws.onclose = () => { setConn(false); setTimeout(connect, 1500); };
+    ws.onerror = () => ws.close();
+    ws.onmessage = (e) => {
+      let m; try { m = JSON.parse(e.data); } catch { return; }
+      if (m.type === "state") { state = m; render(); }
+      else if (m.type === "trace") onTrace(m);
+      else if (m.type === "watch_ok") clearTrace();
+      else if (m.type === "trace_error") addEv("err", "ERR", m.message, "");
+    };
+  }
+  function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+  function setConn(on) {
+    $("dot").className = "dot " + (on ? "on" : "off");
+    $("conn").textContent = on ? "live" : "reconnecting…";
+  }
+
+  // ---------- render ----------
+  const STATUSES = ["all","active","deferred","unsolved","solved"];
+  function renderFilters() {
+    const bar = $("filters");
+    bar.innerHTML = "";
+    STATUSES.forEach(s => {
+      const b = document.createElement("button");
+      b.textContent = s;
+      b.className = filter === s ? "on" : "";
+      b.onclick = () => { filter = s; render(); };
+      bar.appendChild(b);
+    });
+  }
+
+  function render() {
+    const sm = state.summary || {};
+    $("s-solved").textContent = sm.solved ?? 0;
+    $("s-unsolved").textContent = sm.unsolved ?? 0;
+    $("s-active").textContent = sm.active ?? 0;
+    $("s-deferred").textContent = sm.deferred ?? 0;
+    $("s-cost").textContent = "$" + (sm.cost_usd ?? 0).toFixed(2);
+    $("s-budget").textContent = (sm.budget_left_min == null) ? "—" : sm.budget_left_min + "m";
+
+    // challenge list
+    const list = $("chal-list");
+    const rank = { active:0, preparing:1, deferred:2, unsolved:3, solved:4 };
+    const chals = (state.challenges || [])
+      .filter(c => filter === "all" ? true : c.status === filter)
+      .sort((a,b) => (rank[a.status]-rank[b.status]) || (b.value-a.value) || a.name.localeCompare(b.name));
+    $("chal-count").textContent = chals.length;
+    list.innerHTML = "";
+    chals.forEach(c => {
+      const el = document.createElement("div");
+      el.className = "chal" + (c.name === selected ? " sel" : "");
+      const flags = c.flag_count > 1 ? ` · ${c.correct_flag_count}/${c.flag_count} flags` : "";
+      el.innerHTML = `<div class="nm">${esc(c.name)}</div>
+        <span class="pill ${c.status}">${c.status}</span>
+        <div class="meta">${c.value||0} 分${c.level?` · L${c.level}`:""}${c.category?` · ${esc(c.category)}`:""}${flags}</div>`;
+      el.onclick = () => { selected = c.name; render(); };
+      list.appendChild(el);
+    });
+
+    renderSolvers();
+    renderFilters();
+  }
+
+  function renderSolvers() {
+    const wrap = $("solver-list");
+    const ctrl = $("ctrlrow");
+    if (!selected) { ctrl.style.display = "none"; $("sel-title").textContent = "Solvers";
+      wrap.innerHTML = `<div class="empty">选择左侧一道正在运行的题目</div>`; return; }
+    $("sel-title").textContent = selected;
+    const swarm = (state.swarms || {})[selected];
+    const deferredReason = (state.deferred || {})[selected];
+
+    if (!swarm) {
+      ctrl.style.display = "none";
+      wrap.innerHTML = `<div class="empty">该题目当前没有活跃 swarm${deferredReason?`<br><br>DEFERRED：${esc(deferredReason)}`:""}</div>`;
+      return;
+    }
+    ctrl.style.display = "flex";
+    $("ctrl-name").textContent = swarm.paused ? "⏸ paused" : "running";
+
+    const agents = swarm.agents || {};
+    const specs = Object.keys(agents);
+    if (!specs.length) { wrap.innerHTML = `<div class="empty">solver 启动中…</div>`; return; }
+    wrap.innerHTML = "";
+    specs.forEach(spec => {
+      const a = agents[spec];
+      const model = a.model_name || spec;
+      const isW = watching && watching.challenge === selected && watching.model === spec;
+      const el = document.createElement("div");
+      el.className = "solver" + (isW ? " watch" : "");
+      el.innerHTML = `
+        <div class="row1">
+          <span class="model">${esc(model)}</span>
+          <span class="st ${a.status}">${a.status}</span>
+        </div>
+        <div class="bar"><i style="width:${Math.max(2, a.progress||0)}%"></i></div>
+        <div class="sub">
+          <span>步数 ${a.step_count||0}</span>
+          <span>$${(a.cost_usd||0).toFixed(3)}</span>
+          <span>${fmtDur(a.duration_seconds||0)}</span>
+          <button class="act watchbtn" style="margin-left:auto">${isW?"Watching":"Watch"}</button>
+        </div>
+        ${a.findings ? `<div class="finding">${esc(a.findings)}</div>` : ""}`;
+      el.querySelector(".watchbtn").onclick = () => watch(selected, spec);
+      wrap.appendChild(el);
+    });
+  }
+
+  // ---------- controls ----------
+  document.querySelectorAll(".ctrlrow .act").forEach(b => {
+    b.onclick = () => { if (selected) send({ type:"command", action: b.dataset.cmd, challenge: selected }); };
+  });
+
+  function watch(challenge, model) {
+    watching = { challenge, model };
+    $("watch-who").textContent = `${challenge} / ${model}`;
+    $("talk-in").disabled = false; $("talk-send").disabled = false;
+    send({ type:"watch", challenge, model });
+    render();
+  }
+
+  // ---------- trace ----------
+  function clearTrace() { $("trace").innerHTML = ""; }
+  function onTrace(m) {
+    if (!watching || m.challenge !== watching.challenge || m.model !== watching.model) return;
+    const ev = m.event || {};
+    const t = ev.type;
+    if (t === "tool_call") addEv("call", ev.tool || "call", trunc(ev.args), ev.step);
+    else if (t === "tool_result") addEv("result", ev.tool || "result", trunc(ev.result), ev.step);
+    else if (t === "flag_confirmed") addEv("flag", "FLAG", ev.flag || "", ev.step);
+    else if (t === "error" || t === "turn_failed") addEv("err", t, JSON.stringify(stripTs(ev)), ev.step);
+    else if (t === "usage") addEv("meta", "usage", `in=${ev.input_tokens||0} out=${ev.output_tokens||0} $${(ev.cost_usd||0).toFixed(4)}`, "");
+    else if (t === "bump") addEv("meta", "bump", trunc(ev.insights||""), "");
+    else if (t === "finish") addEv("meta", "finish", `status=${ev.status} flag=${ev.flag||"—"}`, "");
+    else if (t === "start") addEv("meta", "start", ev.model||"", "");
+    else if (t === "model_response" && ev.text) addEv("meta", "model", trunc(ev.text), ev.step);
+    else if (t === "loop_detected") addEv("meta", "loop", `${ev.level} on ${ev.tool}`, ev.step);
+  }
+  function addEv(cls, tag, body, step) {
+    const tr = $("trace");
+    const near = tr.scrollHeight - tr.scrollTop - tr.clientHeight < 60;
+    const d = document.createElement("div");
+    d.className = "ev " + cls;
+    d.innerHTML = `<span class="tag">${esc(tag)}</span>${step!==""&&step!=null?`<span class="step">#${step} </span>`:""}${esc(body||"")}`;
+    tr.appendChild(d);
+    while (tr.childElementCount > 1200) tr.removeChild(tr.firstChild);
+    if (near) tr.scrollTop = tr.scrollHeight;
+  }
+
+  // ---------- talk (bump) ----------
+  function sendTalk() {
+    const inp = $("talk-in");
+    const text = inp.value.trim();
+    if (!text || !watching) return;
+    send({ type:"command", action:"bump", challenge: watching.challenge, model: watching.model, message: text });
+    addEv("meta", "you→", text, "");
+    inp.value = "";
+  }
+  $("talk-send").onclick = sendTalk;
+  $("talk-in").addEventListener("keydown", (e) => { if (e.key === "Enter") sendTalk(); });
+
+  // ---------- utils ----------
+  function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+  function trunc(s){ s = String(s==null?"":s); return s.length > 600 ? s.slice(0,600)+" …" : s; }
+  function stripTs(o){ const {ts, ...rest} = o; return rest; }
+  function fmtDur(s){ s = Math.floor(s); if(s<60) return s+"s"; const m=Math.floor(s/60); if(m<60) return m+"m"+(s%60)+"s"; return Math.floor(m/60)+"h"+(m%60)+"m"; }
+
+  renderFilters();
+  render();
+  connect();
+})();
+</script>
+</body>
+</html>
