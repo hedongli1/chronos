@@ -1,15 +1,12 @@
 [project]
 name = "ctf-agent-two"
 version = "0.1.0"
-description = "Agentic offensive security — TSecBench multi-model solver swarm"
+description = "Agentic offensive security — TSecBench headless solver swarm"
 requires-python = ">=3.14"
 dependencies = [
-    "pydantic-ai[bedrock,openai,google]",
+    "pydantic-ai[openai]",
     "pydantic-settings",
     "genai-prices",
-    "boto3",
-    "aiodocker",
-    "claude-agent-sdk",
     "httpx",
     "pyyaml",
     "rich",

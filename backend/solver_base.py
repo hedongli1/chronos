@@ -1,4 +1,4 @@
-"""Solver result type, status constants, and solver protocol — shared across all backends."""
+"""Solver result type, status constants, and solver protocol."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ FLAG_FOUND = "flag_found"
 GAVE_UP = "gave_up"
 CANCELLED = "cancelled"
 ERROR = "error"
-QUOTA_ERROR = "quota_error"
 
 @dataclass
 class SolverResult:
@@ -23,13 +22,10 @@ class SolverResult:
 
 
 class SolverProtocol(Protocol):
-    """Common interface for all solver backends (Pydantic AI, Claude SDK, Codex)."""
+    """Interface the swarm expects from a solver (only HeadlessSolver today)."""
 
     model_spec: str
     agent_name: str
-
-    @property
-    def sandbox(self) -> object: ...
 
     async def start(self) -> None: ...
     async def run_until_done_or_gave_up(self) -> SolverResult: ...

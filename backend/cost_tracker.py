@@ -13,13 +13,9 @@ logger = logging.getLogger(__name__)
 
 # Provider ID mapping for genai-prices
 PROVIDER_MAP: dict[str, str] = {
-    "bedrock": "anthropic",
-    "claude-sdk": "anthropic",
-    "azure": "openai",
-    "zen": "openai",
-    "codex": "openai",
-    "google": "google",
     "deepseek": "deepseek",
+    "qwen": "alibaba",
+    "glm": "zhipu",
 }
 
 # Fallback pricing for models not in genai-prices (per 1M tokens, USD)
@@ -39,40 +35,10 @@ FALLBACK_PRICING: dict[str, dict[str, float]] = {
         "cached_input": 0.03,
         "output": 0.28,
     },
-    "us.anthropic.claude-opus-4-6-v1": {
-        "input": 5.00,
-        "cached_input": 0.50,
-        "output": 25.00,
-    },
-    "claude-opus-4-6": {
-        "input": 5.00,
-        "cached_input": 0.50,
-        "output": 25.00,
-    },
-    "gpt-5.4-mini": {
-        "input": 0.75,
-        "cached_input": 0.075,
-        "output": 4.50,
-    },
-    "gpt-5.4": {
-        "input": 2.50,
-        "cached_input": 0.25,
-        "output": 15.00,
-    },
-    "gpt-5.3-codex": {
-        "input": 1.75,
-        "cached_input": 0.175,
-        "output": 14.00,
-    },
-    "gpt-5.3-codex-spark": {
-        "input": 0.50,
-        "cached_input": 0.05,
-        "output": 2.00,
-    },
-    "gemini-3-flash-preview": {
-        "input": 0.15,
-        "cached_input": 0.02,
-        "output": 0.60,
+    "glm-5.3": {
+        "input": 0.60,
+        "cached_input": 0.11,
+        "output": 2.20,
     },
 }
 

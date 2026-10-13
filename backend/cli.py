@@ -21,9 +21,7 @@ def _setup_logging(verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("botocore").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("aiodocker").setLevel(logging.WARNING)
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)-8s %(message)s", datefmt="%X"))
     logging.basicConfig(level=level, handlers=[handler], force=True)
@@ -84,20 +82,12 @@ async def _check_benchmark_task(settings: Settings) -> bool:
 
 
 @click.command()
-@click.option("--platform", default="tsec", type=click.Choice(["tsec", "local"]), help="Platform mode: tsec (TSecBench) or local (offline challenge directory)")
 @click.option("--platform-url", default=None, help="TSecBench base URL (overrides .env)")
 @click.option("--platform-token", default=None, help="TSecBench API token (overrides .env)")
 @click.option("--benchmark-base-url", default=None, help="Benchmark base URL (overrides .env)")
 @click.option("--benchmark-token", default=None, help="Benchmark API token (overrides .env)")
 @click.option("--benchmark-name", default=None, help="Benchmark run name (overrides .env)")
-@click.option("--image", default="ctf-sandbox", help="Docker sandbox image name")
-@click.option(
-    "--executor",
-    default="auto",
-    type=click.Choice(["auto", "docker", "headless"]),
-    help="Solver executor: 'headless' runs models without any Docker sandbox (tsec defaults to headless)",
-)
-@click.option("--no-exec", is_flag=True, help="Headless mode: disable the local run_python tool")
+@click.option("--no-exec", is_flag=True, help="Disable the local run_python tool")
 @click.option("--time-limit", default=None, type=int, help="Per-challenge wall-clock seconds (default: 1800)")
 @click.option(
     "--total-budget-seconds",
@@ -118,19 +108,14 @@ async def _check_benchmark_task(settings: Settings) -> bool:
     type=click.IntRange(min=1, max=3),
     help="Concurrent range-container window (hard cap 3)",
 )
-@click.option("--dashboard-port", default=8088, type=int, help="Local web dashboard port (0 = disable)")
-@click.option("--dashboard-host", default="127.0.0.1", help="Local web dashboard host")
 @click.option("-i", "--interactive", is_flag=True, help="Enable interactive REPL (type messages in terminal)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 def main(
-    platform: str,
     platform_url: str | None,
     platform_token: str | None,
     benchmark_base_url: str | None,
     benchmark_token: str | None,
     benchmark_name: str | None,
-    image: str,
-    executor: str,
     no_exec: bool,
     time_limit: int | None,
     total_budget_seconds: int | None,
@@ -141,20 +126,17 @@ def main(
     smoke_test: bool,
     model_smoke_test: bool,
     max_challenges: int,
-    dashboard_port: int,
-    dashboard_host: str,
     interactive: bool,
     verbose: bool,
 ) -> None:
-    """Offensive-security agent — TSecBench multi-model solver swarm with interactive REPL support.
+    """Offensive-security agent — TSecBench headless solver swarm with a mechanical scheduler.
 
-    Run without --challenge to start the full coordinator (Ctrl+C to stop).
+    Run without --challenge to start the full scheduler (Ctrl+C to stop).
     Use -i/--interactive to get an interactive REPL in the terminal.
     """
     _setup_logging(verbose)
 
-    settings = Settings(sandbox_image=image)
-    settings.executor_mode = executor
+    settings = Settings()
     if no_exec:
         settings.allow_local_exec = False
     if platform_url:
@@ -168,13 +150,8 @@ def main(
     if benchmark_name:
         settings.benchmark_name = benchmark_name
     settings.max_concurrent_challenges = max_challenges
-    settings.dashboard_port = dashboard_port
-    settings.dashboard_host = dashboard_host
-    settings.platform_mode = platform
+    settings.platform_mode = "tsec"
 
-    from backend.agents.swarm import _resolve_executor_mode
-
-    executor_mode = _resolve_executor_mode(settings)
     if time_limit is not None:
         settings.challenge_time_limit_seconds = time_limit
     if total_budget_seconds is not None:
@@ -195,14 +172,12 @@ def main(
             model_specs = list(DEFAULT_MODELS)
 
     console.print("[bold]Offensive-Security Agent — TSecBench[/bold]")
-    console.print(f"  Platform mode: {platform}")
-    console.print(f"  Platform URL: {settings.platform_url}" if platform != "local" else "  Platform URL: local filesystem")
+    console.print(f"  Platform URL: {settings.platform_url}")
     console.print(f"  Benchmark: {settings.benchmark_url}")
     console.print(f"  Models: {', '.join(model_specs)}")
-    console.print(f"  Executor: {executor_mode}" + (" (no Docker sandbox; http/tcp/run_python tools)" if executor_mode == "headless" else ""))
-    if executor_mode == "headless" and not settings.allow_local_exec:
+    console.print("  Executor: headless (no sandbox; http/tcp/run_python tools)")
+    if not settings.allow_local_exec:
         console.print("  Local exec: disabled (--no-exec)")
-    console.print(f"  Image: {settings.sandbox_image}" if executor_mode == "docker" else "  Image: (unused in headless mode)")
     console.print(f"  Max challenges: {max_challenges}")
     console.print(f"  Per-challenge time limit: {settings.challenge_time_limit_seconds}s")
     if settings.total_benchmark_budget_seconds > 0:
@@ -212,7 +187,6 @@ def main(
         )
     else:
         console.print("  Total benchmark budget: untracked (per-challenge limits only)")
-    console.print(f"  Dashboard: {dashboard_host}:{dashboard_port}" if dashboard_port > 0 else "  Dashboard: disabled")
     if settings.glm_api_key:
         console.print(f"  GLM API Key: configured ({settings.glm_model_id} @ {settings.glm_base_url})")
     if settings.deepseek_api_key:
@@ -225,12 +199,12 @@ def main(
         asyncio.run(_run_model_smoke_test(settings, model_specs))
         return
 
-    if platform == "tsec" and not smoke_test and not asyncio.run(
+    if not smoke_test and not asyncio.run(
         _check_benchmark_vpn(settings.benchmark_url, settings.vpn_health_check_url)
     ):
         sys.exit(1)
 
-    if platform == "tsec" and not smoke_test and not asyncio.run(_check_benchmark_task(settings)):
+    if not smoke_test and not asyncio.run(_check_benchmark_task(settings)):
         sys.exit(1)
 
     if smoke_test:

@@ -376,11 +376,6 @@ class HeadlessSolver:
         self._traced_cache_tokens: int = 0
         self._traced_cost: float = 0.0
 
-    @property
-    def sandbox(self) -> None:
-        """SolverProtocol compatibility — headless runs without a container."""
-        return None
-
     async def start(self) -> None:
         remaining = max(0, int(self.deps.deadline_monotonic - time.monotonic()))
         system_prompt = build_headless_prompt(

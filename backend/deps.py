@@ -59,21 +59,15 @@ class CoordinatorDeps:
     platform: CompetitionPlatform
     cost_tracker: CostTracker
     settings: Any
-    platform_base_url: str = ""
     model_specs: list[str] = field(default_factory=list)
     challenges_root: str = "challenges"
     no_submit: bool = False
     max_concurrent_challenges: int = 10
     challenge_time_limit_seconds: int = 1800
-    target_lock_timeout_seconds: int = 120
-    # Wall-clock start of this coordinator run — used together with
+    # Wall-clock start of this run — used with
     # settings.total_benchmark_budget_seconds to know how much of the WHOLE
     # run is left, not just the current challenge's own budget.
     run_started_monotonic: float = field(default_factory=time.monotonic)
-
-    msg_port: int = 0  # 0 = auto-pick free port
-    dashboard_host: str = "127.0.0.1"
-    dashboard_port: int = 0  # 0 = auto-pick free port
 
     # Runtime state
     coordinator_inbox: asyncio.Queue = field(default_factory=asyncio.Queue)

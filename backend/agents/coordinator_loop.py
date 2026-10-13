@@ -114,7 +114,6 @@ def build_deps(
         platform=platform,
         cost_tracker=cost_tracker,
         settings=settings,
-        platform_base_url=getattr(settings, "platform_url", ""),
         model_specs=specs,
         challenges_root=challenges_root,
         no_submit=no_submit,

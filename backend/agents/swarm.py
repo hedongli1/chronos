@@ -48,17 +48,6 @@ class CancelEvent(asyncio.Event):
         self.set()
 
 
-def _resolve_executor_mode(settings) -> str:
-    """docker | headless. 'auto': benchmark platforms default to headless."""
-    mode = str(getattr(settings, "executor_mode", "auto") or "auto").strip().lower()
-    if mode in ("docker", "headless"):
-        return mode
-    platform_mode = str(getattr(settings, "platform_mode", "") or "").lower()
-    if platform_mode in ("tsec", "tsecbench", "benchmark"):
-        return "headless"
-    return "docker"
-
-
 def _time_limit_for_challenge(settings, meta, remaining_global_seconds: float | None = None) -> int:
     """Per-challenge wall-clock budget; killchain tasks get a longer one.
 
