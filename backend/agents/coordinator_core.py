@@ -128,23 +128,23 @@ async def _start_reserved_swarm(deps: CoordinatorDeps, challenge_name: str) -> s
                 "submit": "DRY RUN" if deps.no_submit else "confirmed by solver",
             }
         elif challenge_name not in deps.deferred_challenges:
-            # Early-exit retry: a swarm that dies after only a handful of steps
-            # (container not ready, transient API error, ...) gets one automatic
-            # re-pull + restart instead of being deferred for the whole run.
+            # Not solved → defer it. The scheduler's rolling retry re-opens
+            # deferred challenges only after a cooldown and only when the window
+            # has spare capacity, so a just-failed challenge is NOT re-opened
+            # immediately — that would burn a container start + a full model run
+            # for nothing. A fast early-exit (likely a transient startup problem)
+            # is labeled as such but follows the same cooldown-gated retry.
             steps = result.step_count if result else 0
-            if steps < EARLY_EXIT_MIN_STEPS and challenge_name not in deps.early_retried:
-                deps.early_retried.add(challenge_name)
-                logger.warning(
-                    "[%s] Early exit after %d steps — will retry once automatically",
-                    challenge_name, steps,
-                )
-                deps.coordinator_inbox.put_nowait(
-                    f"EARLY EXIT: '{challenge_name}' ended after only {steps} steps without "
-                    "a result (likely a transient startup problem). It has been re-queued "
-                    "automatically — the scheduler will retry it once with a fresh container."
-                )
-            else:
-                deps.deferred_challenges[challenge_name] = "solver attempts exhausted"
+            note = (
+                f"early exit ({steps} steps)"
+                if steps < EARLY_EXIT_MIN_STEPS
+                else "solver attempts exhausted"
+            )
+            deps.deferred_challenges[challenge_name] = note
+            logger.info(
+                "[%s] %s — deferred; rolling retry re-opens it after the cooldown",
+                challenge_name, note,
+            )
 
     async with deps.spawn_lock:
         deps.swarms[challenge_name] = swarm

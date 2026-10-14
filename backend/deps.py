@@ -78,7 +78,6 @@ class CoordinatorDeps:
     spawn_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_spawns: set[str] = field(default_factory=set)
     open_containers: set[str] = field(default_factory=set)  # challenges with a live range container
-    early_retried: set[str] = field(default_factory=set)  # early-exit challenges already retried once
     spawn_failures: dict[str, int] = field(default_factory=dict)  # consecutive spawn failures per challenge
     last_ghost_reap: float = 0.0  # last time stale platform containers were reaped
     swarms: dict[str, Any] = field(default_factory=dict)
