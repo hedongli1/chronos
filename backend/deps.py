@@ -84,6 +84,8 @@ class CoordinatorDeps:
     swarms: dict[str, Any] = field(default_factory=dict)
     swarm_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
     deferred_challenges: dict[str, str] = field(default_factory=dict)
+    challenge_attempts: dict[str, int] = field(default_factory=dict)  # spawns per challenge (for retry cap)
+    defer_time: dict[str, float] = field(default_factory=dict)  # monotonic ts of last defer (retry cooldown)
     results: dict[str, dict] = field(default_factory=dict)
     challenge_dirs: dict[str, str] = field(default_factory=dict)
     challenge_metas: dict[str, ChallengeMeta] = field(default_factory=dict)

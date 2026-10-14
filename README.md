@@ -37,12 +37,13 @@ HeadlessSolver × N（同构，可并行竞速；默认单模型）
 
 ## 平台规则适配
 
-- **单题时间预算**默认 1800s（30 分钟，可用 `--time-limit` 覆盖）；超时仍未解出即关闭靶场、标记 `DEFERRED`，并发名额立即让给下一道未解题（事后可用 `/resume` 重开，会启动新容器重新开始）
+- **单题时间预算**默认 1800s（30 分钟，可用 `--time-limit` 覆盖）；超时仍未解出即关闭靶场、标记 `DEFERRED`，并发名额立即让给下一道未解题（之后由"deferred 滚动重试"自动重开，也可 `/resume` 手动重开）
 - **并发窗口**严格限制为最多 3 个活跃靶场容器（按容器数限流）；题目解决或超时后自动 close 释放名额，并自动补入下一题
 - **容器防重**：同一题在进程内只 start 一次（地址缓存复用）；容器启动中的等待走只读轮询
 - **多 flag 语义**：`correct` 但未通关返回部分得分提示，Solver 继续竞速直到 `challenge_complete`
 - **hint**：`request_hint` 是一个普通工具，获取平台提示（会扣分、每题限 1 次），由模型自行决定是否值得——不设门槛、不做 benchmark 行为调参
-- **死锁自愈**：所有未解题都被 defer 且无活跃 swarm 的状态持续 240 秒（`AUTO_RESUME_IDLE_SECONDS`）后，自动清空 deferred 列表重新补位
+- **deferred 滚动重试**：窗口一旦有空位且没有"新鲜"（从未尝试过）的题可填，就自动把 deferred 的题捞回来重试——**无需操作员 /resume**。每题最多 `MAX_CHALLENGE_ATTEMPTS`（默认 3）次,之后维持 deferred 直至人工重开；距上次 defer 要过 `DEFER_RETRY_COOLDOWN_SECONDS`（默认 120s）冷却才重试,避免刚失败就被塞回原位空转
+- **死锁自愈**：所有未解题都被 defer 且无活跃 swarm 的状态持续 240 秒（`AUTO_RESUME_IDLE_SECONDS`）后，自动清空 deferred 列表重新补位（兜底：连 attempts 用尽的题也会在收尾阶段再试一轮）
 - **早夭重试**：swarm 不足 15 步就异常结束（容器未就绪/瞬时报错）时自动重拉重试一次
 - **提交熔断**：一题累计 4 次错误提交（跨模型合计）即锁定本题提交并让 swarm 退场，防止"猜 flag"烧光时间预算
 - **部分得分止损**：多 flag 题拿到部分分后，若 600 秒（`PARTIAL_STALL_SECONDS`）内没有新 flag 被接受，带着已有分数撤退换题

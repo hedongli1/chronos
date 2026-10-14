@@ -94,6 +94,20 @@ class Settings(BaseSettings):
     auto_resume_idle_seconds: int = Field(
         default=240, validation_alias=AliasChoices("AUTO_RESUME_IDLE_SECONDS"),
     )
+    # Rolling retry of deferred challenges: once the window has a free slot and
+    # no never-tried challenge is left to fill it, deferred ones are retried
+    # automatically (no operator /resume needed). Each challenge gets at most
+    # this many spawn attempts total before it stays deferred until an operator
+    # re-enables it; 0 disables the cap (retry forever while capacity is free).
+    max_challenge_attempts: int = Field(
+        default=3, validation_alias=AliasChoices("MAX_CHALLENGE_ATTEMPTS"),
+    )
+    # Wait at least this long after a challenge is deferred before auto-retrying
+    # it, so fresh challenges and other deferred ones get a turn first and a
+    # just-failed task is not immediately re-spawned into the slot it vacated.
+    defer_retry_cooldown_seconds: int = Field(
+        default=120, validation_alias=AliasChoices("DEFER_RETRY_COOLDOWN_SECONDS"),
+    )
     # Multi-stage penetration (killchain) tasks get a longer wall-clock budget.
     killchain_time_limit_seconds: int = Field(
         default=2700, validation_alias=AliasChoices("KILLCHAIN_TIME_LIMIT_SECONDS"),

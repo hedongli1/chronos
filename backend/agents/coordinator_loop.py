@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -228,6 +229,7 @@ async def run_event_loop(
             for name, task in list(deps.swarm_tasks.items()):
                 if task.done():
                     if name in deps.deferred_challenges:
+                        deps.defer_time[name] = time.monotonic()  # start the retry cooldown
                         logger.info(
                             "Deferred: %s (%s)", name, deps.deferred_challenges[name]
                         )
@@ -367,9 +369,13 @@ async def _handle_resume(deps: CoordinatorDeps, poller, challenge_name: str) -> 
         names = sorted(deps.deferred_challenges)
         for n in names:
             deps.deferred_challenges.pop(n, None)
+            deps.challenge_attempts.pop(n, None)  # operator wants a clean retry
+            deps.defer_time.pop(n, None)
         print(f"  Re-enabled {len(names)} deferred challenges; refilling window...")
         await _auto_spawn_unsolved(deps, poller)
         return
+    deps.challenge_attempts.pop(challenge_name, None)
+    deps.defer_time.pop(challenge_name, None)
     was_deferred = deps.deferred_challenges.pop(challenge_name, None)
     swarm = deps.swarms.get(challenge_name)
     task = deps.swarm_tasks.get(challenge_name)
@@ -501,17 +507,32 @@ async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
         from backend.agents.coordinator_core import do_spawn_swarm
         result = await do_spawn_swarm(deps, challenge_name)
         deps.spawn_failures.pop(challenge_name, None)
-        logger.info(f"Auto-spawn {challenge_name}: {result[:100]}")
+        deps.challenge_attempts[challenge_name] = deps.challenge_attempts.get(challenge_name, 0) + 1
+        logger.info(f"Auto-spawn {challenge_name} (attempt {deps.challenge_attempts[challenge_name]}): {result[:100]}")
     except Exception as e:
         # Consecutive spawn failures (capacity walls, dead starts) should not
-        # hammer the platform every tick — defer after 2 in a row; /resume or
-        # the auto-resume cycle can re-enable it later.
+        # hammer the platform every tick — defer after 2 in a row; the rolling
+        # retry or /resume can re-enable it later.
         fails = deps.spawn_failures.get(challenge_name, 0) + 1
         deps.spawn_failures[challenge_name] = fails
         logger.warning(f"Auto-spawn failed for {challenge_name} ({fails}): {e}")
         if fails >= 2:
             deps.deferred_challenges[challenge_name] = f"spawn failed {fails}x: {str(e)[:120]}"
+            deps.defer_time[challenge_name] = time.monotonic()
             logger.warning("[%s] deferred after repeated spawn failures", challenge_name)
+
+
+def _retry_eligible(deps: CoordinatorDeps, name: str, now: float) -> bool:
+    """A deferred challenge may be auto-retried when it was not held by an
+    operator, still has attempts left, and its post-defer cooldown has elapsed."""
+    # Operator-killed challenges stay down until an explicit /resume.
+    if deps.deferred_challenges.get(name, "").startswith("stopped by operator"):
+        return False
+    max_attempts = int(getattr(deps.settings, "max_challenge_attempts", 3) or 0)
+    if max_attempts and deps.challenge_attempts.get(name, 0) >= max_attempts:
+        return False
+    cooldown = float(getattr(deps.settings, "defer_retry_cooldown_seconds", 120))
+    return now - deps.defer_time.get(name, 0.0) >= cooldown
 
 
 async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
@@ -529,17 +550,31 @@ async def _auto_spawn_unsolved(deps: CoordinatorDeps, poller) -> None:
         return
 
     running = {name for name, task in deps.swarm_tasks.items() if not task.done()}
-    candidates: list[str] = []
-    for name in unsolved:
-        if len(candidates) >= slots:
-            break
-        if name in running:
-            continue
-        if name in deps.pending_spawns:
-            continue
-        if name in deps.deferred_challenges:
-            continue
-        candidates.append(name)
+
+    def _busy(name: str) -> bool:
+        return name in running or name in deps.pending_spawns
+
+    # Fresh (never-deferred) challenges fill the window first, by priority.
+    candidates = [n for n in unsolved if not _busy(n) and n not in deps.deferred_challenges]
+    candidates = candidates[:slots]
+
+    # Rolling retry: if slots remain and no fresh work is left, refill from
+    # deferred challenges that still have attempts and whose cooldown elapsed —
+    # fewest-attempts first, then priority. This un-defers them so they re-spawn
+    # without needing an operator /resume.
+    remaining = slots - len(candidates)
+    if remaining > 0:
+        now = time.monotonic()
+        retryable = [
+            n for n in unsolved
+            if n in deps.deferred_challenges and not _busy(n) and _retry_eligible(deps, n, now)
+        ]
+        retryable.sort(key=lambda n: (deps.challenge_attempts.get(n, 0),
+                                      _challenge_priority_key(n, stubs)))
+        for n in retryable[:remaining]:
+            reason = deps.deferred_challenges.pop(n, "")
+            logger.info("Auto-retry deferred challenge: %s (was: %s)", n, reason)
+            candidates.append(n)
 
     if candidates:
         await asyncio.gather(
