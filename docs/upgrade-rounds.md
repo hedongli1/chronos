@@ -29,8 +29,19 @@
 | R3 | 缺陷清零（剩余中危 + 高价值低危） | ✅ | 29 tests 绿、ty 0 |
 | R4 | 两个新功能（findings 通道 + opt-in 记忆，基线先行） | ✅ | 40 tests 绿 |
 | R5 | 文档沉淀 + 依赖锁定（uv.lock 入库、README/架构文档） | ✅ | ruff+ty 绿 |
-| R6 | 对抗性交叉验证（独立复审全部改动） | 进行中 | 验证通过 |
-| R7 | 终验门：全量测试 + 静态检查 + 推送分支 + 开 PR | 待办 | 全部门禁 |
+| R6 | 对抗性交叉验证（独立复审全部改动） | ✅ | 28 条确认，全部修复（含 2 条高危回归） |
+| R7 | 终验门：全量测试 + 静态检查 + 推送分支 + 开 PR | 进行中 | 全部门禁 |
+
+## R6 结果
+
+4 路审查（correctness/safety/concurrency/contract）+ 逐条对抗验证，29 条原始发现、
+28 条确认（high 7 含重复 / medium 9 / low 12）。其中**两条高危是我在升级过程中引入的回归**：
+- `step_count` property 插入了 `__init__` 中间，四个 `_traced_*` 初始化变成 property 体内
+  死代码 → `_result()` 每条路径 AttributeError（reviewer 抓出，已修 + 回归锁测试）；
+- run_python 守卫序言无条件引用 `socket.socket.sendmsg`（仅 Unix 有）→ Windows 上每次
+  run_python 崩溃（已改为 hasattr 守卫 + 测试锁）。
+其余 medium/low 全部修复：poller ok 标志时序、bump 竞态、重复 /start、`del _os`
+闭包错误、web 队列、索引重建、重定向语义、watchdog 暂停时钟等。42 tests 绿。
 
 ## R1 结果
 
