@@ -112,6 +112,16 @@ async def _check_benchmark_task(settings: Settings) -> bool:
 @click.option("--web", is_flag=True, help="Launch the web console (live visualization + operator control + solver watch/talk)")
 @click.option("--web-host", default="127.0.0.1", help="Web console host (default: 127.0.0.1)")
 @click.option("--web-port", default=8000, type=int, help="Web console port (default: 8000)")
+@click.option(
+    "--cross-task-memory",
+    is_flag=True,
+    help="Enable the cross-task memory tools (remember/recall_memory; see rewrite-plan 已拍板)",
+)
+@click.option(
+    "--findings-output",
+    is_flag=True,
+    help="Enable the record_finding tool (vuln/credential findings log; see rewrite-plan 已拍板)",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging")
 def main(
     platform_url: str | None,
@@ -133,6 +143,8 @@ def main(
     web: bool,
     web_host: str,
     web_port: int,
+    cross_task_memory: bool,
+    findings_output: bool,
     verbose: bool,
 ) -> None:
     """Offensive-security agent — TSecBench headless solver swarm with a mechanical scheduler.
@@ -145,6 +157,10 @@ def main(
     settings = Settings()
     if no_exec:
         settings.allow_local_exec = False
+    if cross_task_memory:
+        settings.cross_task_memory_enabled = True
+    if findings_output:
+        settings.findings_output_enabled = True
     if platform_url:
         settings.platform_url = platform_url
     if platform_token:
@@ -190,6 +206,10 @@ def main(
     console.print(f"  Benchmark: {settings.benchmark_url}")
     console.print(f"  Models: {', '.join(model_specs)}")
     console.print("  Executor: headless (no sandbox; http/tcp/run_python tools)")
+    if settings.cross_task_memory_enabled:
+        console.print("  Cross-task memory: ENABLED (opt-in)")
+    if settings.findings_output_enabled:
+        console.print("  Findings output: ENABLED (opt-in)")
     if not settings.allow_local_exec:
         console.print("  Local exec: disabled (--no-exec)")
     console.print(f"  Max challenges: {settings.max_concurrent_challenges}")

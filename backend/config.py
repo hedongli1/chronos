@@ -138,4 +138,17 @@ class Settings(BaseSettings):
         default="http://10.0.100.58", validation_alias=AliasChoices("VPN_HEALTH_CHECK_URL"),
     )
 
+    # Opt-in subsystems (default OFF — see docs/rewrite-plan.md "已拍板"):
+    # cross-task memory gives the solver remember/recall_memory tools backed by
+    # logs/cross-task-memory.jsonl; findings output gives it a record_finding
+    # tool writing logs/findings-<challenge>.jsonl. Neither feeds scoring.
+    cross_task_memory_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("CROSS_TASK_MEMORY_ENABLED", "TSECBENCH_CROSS_TASK_MEMORY"),
+    )
+    findings_output_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("FINDINGS_OUTPUT_ENABLED", "TSECBENCH_FINDINGS_OUTPUT"),
+    )
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}

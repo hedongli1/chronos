@@ -91,12 +91,14 @@ def build_headless_prompt(
     *,
     remaining_seconds: int | None = None,
     allow_exec: bool = True,
+    extra_tools: list[str] | None = None,
 ) -> str:
     """Build the solver's system prompt: a neutral task contract.
 
     Objective + tool contract + submission format + hard constraints. No attack
     methodology, no per-scenario playbook, no procedure — how to search is left
-    entirely to the model.
+    entirely to the model. `extra_tools` lists opt-in tool descriptions
+    (memory/findings subsystems) appended verbatim to the contract.
     """
     addrs = [a.strip() for a in re.split(r"[,\s]+", meta.connection_info) if a.strip()]
 
@@ -164,6 +166,11 @@ def build_headless_prompt(
         "- `task_status()`: accepted/total flag count and remaining time.",
         "- `check_findings()` / `notify_coordinator(msg)`: read sibling findings / report upward.",
         "",
+    ]
+    if extra_tools:
+        lines.extend(extra_tools)
+        lines.append("")
+    lines += [
         "## Constraints",
         "- Flags on this platform look like `flag{...}` (or `CTF{...}`) — submit the token verbatim.",
         "- Submit flags verbatim as observed in THIS task's target output. Never guess, fabricate,",

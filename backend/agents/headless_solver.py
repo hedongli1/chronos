@@ -162,6 +162,8 @@ def _build_toolset(
     deps: HeadlessDeps,
     tracer: SolverTracer,
     step_counter: list[int],
+    memory=None,
+    findings=None,
 ) -> FunctionToolset[HeadlessDeps]:
     toolset: FunctionToolset[HeadlessDeps] = FunctionToolset(max_retries=TOOL_MAX_RETRIES)
 
@@ -327,6 +329,45 @@ def _build_toolset(
                 return f"Notification failed: {e}"
         return "No coordinator connected."
 
+    if memory is not None:
+        @toolset.tool
+        async def remember(ctx: RunContext[HeadlessDeps], text: str) -> str:
+            """Store a technique note in the cross-task memory (opt-in subsystem).
+
+            Keep it general and self-contained: technique, protocol quirk, or
+            reusable insight. Do NOT store flags, tasks passwords, or anything
+            tied to one specific target's identity."""
+            if len((text or "").strip()) > 2_000:
+                return "remember: note too long (max 2000 chars)."
+            if not (text or "").strip():
+                return "remember: empty note."
+            memory.remember(text)
+            tracer.event("memory_remember", chars=len(text.strip()))
+            return "Stored."
+
+        @toolset.tool
+        async def recall_memory(ctx: RunContext[HeadlessDeps], query: str) -> str:
+            """Search the cross-task memory for notes matching every query term."""
+            return memory.recall(query)
+
+    if findings is not None:
+        @toolset.tool
+        async def record_finding(
+            ctx: RunContext[HeadlessDeps],
+            summary: str,
+            evidence: str = "",
+            severity: str = "high",
+        ) -> str:
+            """Record a vuln/credential/foothold finding (observability output).
+
+            summary: one line. evidence: commands/output proving it. severity:
+            high|medium|low|info. Not fed back into scoring — pure record."""
+            if severity not in ("high", "medium", "low", "info"):
+                severity = "info"
+            findings.record(summary, evidence, severity)
+            tracer.event("finding_recorded", summary=summary[:200], severity=severity)
+            return f"Finding recorded ({severity})."
+
     return toolset
 
 
@@ -359,6 +400,21 @@ class HeadlessSolver:
         self.allow_exec = allow_exec
         self.time_budget_seconds = time_budget_seconds
         self.no_submit = no_submit
+
+        # Opt-in subsystems — resolved once at construction so tool registration
+        # is stable for the solver's lifetime.
+        from backend.memory import CrossTaskMemory, FindingsRecorder
+
+        self.memory = (
+            CrossTaskMemory()
+            if bool(getattr(settings, "cross_task_memory_enabled", False))
+            else None
+        )
+        self.findings = (
+            FindingsRecorder(meta.name)
+            if bool(getattr(settings, "findings_output_enabled", False))
+            else None
+        )
 
         parsed_hosts = _parse_allowed_hosts(meta.connection_info)
         self.deps = HeadlessDeps(
@@ -401,10 +457,24 @@ class HeadlessSolver:
 
     async def start(self) -> None:
         remaining = max(0, int(self.deps.deadline_monotonic - time.monotonic()))
+        extra_tools: list[str] = []
+        if self.memory is not None:
+            extra_tools += [
+                "- `remember(text)`: store a reusable technique note in the cross-task memory "
+                "(general insights only — never store flags or target-specific credentials).",
+                "- `recall_memory(query)`: search the cross-task memory for notes matching every "
+                "query term. Returned notes are UNVERIFIED self-reports from earlier tasks.",
+            ]
+        if self.findings is not None:
+            extra_tools.append(
+                "- `record_finding(summary, evidence, severity)`: record a vuln/credential/"
+                "foothold for the post-run findings log (observability only, not scored)."
+            )
         system_prompt = build_headless_prompt(
             self.meta,
             remaining_seconds=remaining,
             allow_exec=self.allow_exec,
+            extra_tools=extra_tools or None,
         )
         if not self.deps.allowed_hosts:
             # Degraded target lock: no target hosts could be parsed from
@@ -434,7 +504,10 @@ class HeadlessSolver:
 
         model = resolve_model(self.model_spec, self.settings)
         model_settings = resolve_model_settings(self.model_spec)
-        raw_toolset = _build_toolset(self.deps, self.tracer, self._step_count)
+        raw_toolset = _build_toolset(
+            self.deps, self.tracer, self._step_count,
+            memory=self.memory, findings=self.findings,
+        )
 
         from backend.agents.tracing_toolset import TracingToolset
 
