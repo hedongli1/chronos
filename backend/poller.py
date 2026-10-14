@@ -64,7 +64,10 @@ class PlatformPoller:
             self._known_challenges = {ch["name"] for ch in stubs}
             self._known_stubs = {ch["name"]: ch for ch in stubs}
             self._known_solved = solved
-            self._last_poll_ok = True
+            # A trustworthy snapshot is positive evidence the platform answers.
+            # An EMPTY challenge list is not — TSec always lists its tasks even
+            # when all are solved, so [] means "degraded fetch", not "done".
+            self._last_poll_ok = bool(self._known_challenges)
             self._consecutive_failures = 0
         except RuntimeError:
             # Fatal platform state (task finished / invalid token): propagate.
@@ -138,23 +141,31 @@ class PlatformPoller:
     async def _poll_once(self) -> None:
         try:
             stubs, current_solved = await self._fetch_state()
-            self._last_poll_ok = True
-            self._consecutive_failures = 0
             current_names = {ch["name"] for ch in stubs}
 
-            # Sanity check: if results look bogus compared to what we know, skip.
+            # Sanity checks FIRST — a degraded fetch must never count as a
+            # successful poll. Empty is always suspicious: TSec lists tasks
+            # even when all are solved, so [] means "fetch failed", not "done".
+            if not current_names:
+                logger.warning(
+                    "Poll returned 0 challenges%s — skipping",
+                    f" (had {len(self._known_challenges)})" if self._known_challenges else "",
+                )
+                self._consecutive_failures += 1
+                return
             if self._known_challenges and len(current_names) < len(self._known_challenges) // 2:
                 logger.warning(f"Poll returned suspicious data ({len(current_names)} challenges vs {len(self._known_challenges)} known) — skipping")
-                return
-            # Single known challenge: any drop to zero is suspicious (a stale
-            # [] answer would otherwise be accepted as "the run is over").
-            if self._known_challenges and not current_names:
-                logger.warning("Poll returned 0 challenges (had %d) — skipping", len(self._known_challenges))
+                self._consecutive_failures += 1
                 return
             # Don't let solved count regress (API might return empty on errors)
             if self._known_solved and not current_solved:
                 logger.warning("Poll returned 0 solved (had %d) — skipping", len(self._known_solved))
+                self._consecutive_failures += 1
                 return
+
+            # A trustworthy snapshot: positive evidence the platform answers.
+            self._last_poll_ok = True
+            self._consecutive_failures = 0
 
             # Detect new challenges
             new_challenges = current_names - self._known_challenges

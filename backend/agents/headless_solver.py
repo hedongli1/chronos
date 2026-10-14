@@ -240,6 +240,7 @@ def _build_toolset(
             timeout=timeout,
             allowed_hosts=ctx.deps.allowed_hosts,
             workdir=ctx.deps.workdir or None,
+            allow_subprocess=ctx.deps.allow_subprocess,
         )
 
     @toolset.tool
@@ -427,6 +428,7 @@ class HeadlessSolver:
             model_spec=model_spec,
             notify_coordinator=notify_coordinator,
             allow_exec=allow_exec,
+            allow_subprocess=bool(getattr(settings, "run_python_allow_subprocess", False)),
             workdir=workdir,
             no_submit=no_submit,
             flags_total=max(1, meta.flag_count),
@@ -445,15 +447,15 @@ class HeadlessSolver:
         self._confirmed: bool = False
         self._findings: str = ""
         self._usage_traced: bool = False
+        self._traced_input_tokens: int = 0
+        self._traced_output_tokens: int = 0
+        self._traced_cache_tokens: int = 0
+        self._traced_cost: float = 0.0
 
     @property
     def step_count(self) -> int:
         """Current step count (tool calls made) for status reporting."""
         return self._step_count[0]
-        self._traced_input_tokens: int = 0
-        self._traced_output_tokens: int = 0
-        self._traced_cache_tokens: int = 0
-        self._traced_cost: float = 0.0
 
     async def start(self) -> None:
         remaining = max(0, int(self.deps.deadline_monotonic - time.monotonic()))
@@ -538,6 +540,7 @@ class HeadlessSolver:
         t0 = time.monotonic()
         steps_before = self._step_count[0]
         usage_acc = None  # filled below; kept for the exception paths
+        usage_recorded = False  # True once this run's usage hit cost_tracker
 
         try:
             from pydantic_ai.usage import RunUsage, UsageLimits
@@ -547,6 +550,7 @@ class HeadlessSolver:
             # readable here (pydantic-ai mutates the passed object in place),
             # so interrupted runs keep their token accounting.
             usage_acc = RunUsage()
+            history_bump = self._pending_bump  # snapshot: bump THIS run may consume
             result = await self._agent.run(
                 "Solve this task." if not self._messages else "Continue solving.",
                 deps=self.deps,
@@ -564,8 +568,12 @@ class HeadlessSolver:
                 provider_spec=provider_from_spec(self.model_spec),
                 duration_seconds=duration,
             )
+            usage_recorded = True
             self._messages = result.all_messages()
-            self._pending_bump = None  # consumed by this run (it was in the history)
+            # Only clear the bump this run consumed — a bump that landed while
+            # the run was in flight must survive for the NEXT attempt.
+            if self._pending_bump is history_bump:
+                self._pending_bump = None
 
             output = result.output
             if isinstance(output, str) and output.strip():
@@ -597,7 +605,11 @@ class HeadlessSolver:
 
         except asyncio.CancelledError:
             reason = getattr(self.cancel_event, "reason", "") or "unknown"
-            self._record_interrupted_usage(usage_acc, duration=time.monotonic() - t0)
+            if not usage_recorded:
+                # The run itself was cancelled before completion — record the
+                # partial usage. (If record() already ran and the cancellation
+                # landed during a post-run await, the tokens are already in.)
+                self._record_interrupted_usage(usage_acc, duration=time.monotonic() - t0)
             # The run can be cancelled between the platform's flag confirmation
             # and this return (sibling win, wall-clock kill, ...). A confirmed
             # flag is a solve regardless of the cancellation.
@@ -608,7 +620,8 @@ class HeadlessSolver:
             return self._result(CANCELLED, cancel_reason=reason)
         except Exception as e:
             logger.error(f"[{self.agent_name}] Error: {e}", exc_info=True)
-            self._record_interrupted_usage(usage_acc, duration=time.monotonic() - t0)
+            if not usage_recorded:
+                self._record_interrupted_usage(usage_acc, duration=time.monotonic() - t0)
             self._findings = f"Error: {e}"
             self.tracer.event("error", error=str(e))
             # Mirror the cancellation guard: a flag confirmed right before an

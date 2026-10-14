@@ -43,6 +43,9 @@ class TSecBenchmarkPlatform:
     # unique_code -> container addrs for containers we started this process.
     # Prevents duplicate /start calls (each one spawns another range instance).
     _started_addrs: dict[str, list[str]] = field(default_factory=dict)
+    # unique_codes we already fired /start for (even when it returned no
+    # address yet) — a retry must poll, not POST again.
+    _start_attempted: set[str] = field(default_factory=set)
 
     # ------------------------------------------------------------------ #
     #  Internal helpers
@@ -164,9 +167,12 @@ class TSecBenchmarkPlatform:
         # Rebuild the index from the newest listing instead of merging into a
         # stale copy — container_addr / status / flag counts must reflect the
         # platform's current state (a cached recycled address would otherwise
-        # be reused with no freshness check). Solved state is terminal on the
-        # platform, so _solved_cache is only ever added to.
-        self._challenge_index = fresh_index
+        # be reused with no freshness check). A transiently EMPTY listing is
+        # never evidence of anything, so it leaves the previous index intact
+        # (the poller drops those polls anyway). Solved state is terminal on
+        # the platform, so _solved_cache is only ever added to.
+        if fresh_index:
+            self._challenge_index = fresh_index
         return challenges
 
     async def fetch_solved_names(self) -> set[str]:
@@ -233,17 +239,19 @@ class TSecBenchmarkPlatform:
                                 f'DUPLICATE — "{flag}" already banked, and the platform '
                                 "now reports the challenge completed.",
                                 challenge_complete=True,
-                                progress="all flags banked",
+                                progress=f"{total_flags}/{total_flags} flags",
                             )
+                        fresh_correct = int(fresh.get("correct_flag_count", 0) or 0)
+                        progress = f"{max(fresh_correct, 1)}/{total_flags} flags"
                     except Exception:
-                        pass  # fall through to the conservative below
+                        progress = f"1/{total_flags} flags"
                     return SubmitResult(
                         "correct",
                         message,
                         f'DUPLICATE — "{flag}" was already banked for {challenge_name}. '
                         "Other flags are still open — pivot to a different attack surface.",
                         challenge_complete=False,
-                        progress=f"duplicate of a banked flag (/{total_flags} total)",
+                        progress=progress,
                     )
                 return SubmitResult(
                     "already_solved",
@@ -422,12 +430,18 @@ class TSecBenchmarkPlatform:
                         body = e.response.text
                     except Exception:
                         pass
-                    if "already" in body or "invalid_state" in body or "closed" in body:
+                    # "already closed" style states are NOT failures. Match
+                    # precise markers — a bare "closed" substring also matches
+                    # negative payloads like "closed: false".
+                    already = ("already closed" in body or "invalid_state" in body
+                               or "already_close" in body)
+                    if already:
                         logger.warning(
                             "TSec close %s: platform says already closed (%s) — treating as success",
                             unique_code, body[:120],
                         )
                         self._started_addrs.pop(unique_code, None)
+                        self._start_attempted.discard(unique_code)
                         return {"unique_code": unique_code, "closed": True}
                     raise
                 if attempt < 3:
@@ -448,6 +462,7 @@ class TSecBenchmarkPlatform:
         if resp is None:
             raise RuntimeError(f"TSec close {unique_code}: failed after retries")
         self._started_addrs.pop(unique_code, None)
+        self._start_attempted.discard(unique_code)
         return {
             "unique_code": resp.get("unique_code", unique_code),
             "closed": resp.get("closed", True),
@@ -487,10 +502,12 @@ class TSecBenchmarkPlatform:
             # up would spawn a second range instance for the same task.
             import asyncio as _aio
 
-            try:
-                await self.start_challenge(unique_code)
-            except Exception as e:
-                logger.warning("TSec start_challenge failed for %s: %s", unique_code, e)
+            if unique_code not in self._start_attempted:
+                self._start_attempted.add(unique_code)
+                try:
+                    await self.start_challenge(unique_code)
+                except Exception as e:
+                    logger.warning("TSec start_challenge failed for %s: %s", unique_code, e)
             addrs = self._started_addrs.get(unique_code, [])
             for _ in range(10):  # up to ~30s for the container to become available
                 if addrs:

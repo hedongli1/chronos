@@ -59,7 +59,14 @@ async def do_raw_http(
         if allowed_hosts is None:
             return None
         host = (_urlparse(hop).hostname or "").strip().lower()
-        if host and host not in allowed_hosts:
+        # Fail closed on unparsable hosts too — an empty hostname is never in
+        # the allowed set, and letting it pass reopens the //host smuggling gap.
+        if not host:
+            return (
+                "http_request error: redirect target has no parseable host — "
+                "the redirect was NOT followed."
+            )
+        if host not in allowed_hosts:
             return (
                 f"http_request error: redirect target '{host}' is outside the "
                 f"authorized scope ({', '.join(sorted(allowed_hosts))}). "
@@ -85,11 +92,21 @@ async def do_raw_http(
             follow_redirects=False,
             trust_env=False,
         ) as client:
-            for _hop in range(max_redirects + 1):
+            last_status = 0  # status of the previous hop (redirect semantics)
+            for hop in range(max_redirects + 1):
                 block = _checked_hop(current)
                 if block:
                     return block
-                resp = await client.request(method.upper(), current, headers=req_headers, content=content)
+                hop_method = method.upper()
+                hop_content = content
+                if hop > 0 and last_status not in (307, 308):
+                    # Mirror standard client semantics (httpx with
+                    # follow_redirects=True): non-replay redirects become GET
+                    # with no body — never re-send credentials/payloads.
+                    hop_method = "GET"
+                    hop_content = None
+                resp = await client.request(hop_method, current, headers=req_headers, content=hop_content)
+                last_status = resp.status_code
                 header_lines = "\n".join(f"{k}: {v}" for k, v in resp.headers.items())
                 transcript_parts.append(
                     f"HTTP {resp.status_code} {resp.reason_phrase}\n"

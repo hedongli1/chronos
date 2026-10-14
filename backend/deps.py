@@ -34,6 +34,9 @@ class HeadlessDeps:
     no_submit: bool = False
     notify_coordinator: Callable[[str], Awaitable[None]] | None = None
     allow_exec: bool = True
+    # Opt-out for the run_python subprocess refusal (children would escape
+    # the socket allowlist). Default False = refuse subprocess in snippets.
+    allow_subprocess: bool = False
     # Per solver-run working directory for run_python (isolated, kept for
     # post-mortems). Empty = fall back to the shared system temp dir.
     workdir: str = ""

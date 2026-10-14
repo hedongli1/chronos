@@ -29,6 +29,7 @@ async def do_run_python(
     timeout: float = DEFAULT_TIMEOUT,
     allowed_hosts: frozenset[str] | None = None,
     workdir: str | None = None,
+    allow_subprocess: bool = False,
 ) -> str:
     """Execute a Python snippet on the host and return stdout/stderr.
 
@@ -39,8 +40,8 @@ async def do_run_python(
     the asyncio connection paths. Subprocess escape hatches (subprocess,
     os.system, os.exec*/spawn*/popen) are refused — child processes would not
     inherit the in-process patches and would escape the allowlist; set
-    RUN_PYTHON_ALLOW_SUBPROCESS=1 in the environment to opt out (operator
-    decision, documented gap).
+    allow_subprocess=True (RUN_PYTHON_ALLOW_SUBPROCESS=1) to opt out
+    (operator decision, documented gap).
 
     workdir: per solver-run working directory. The snippet file is written
     there, the child process runs with it as cwd, and TMP/TEMP/TMPDIR point
@@ -76,14 +77,18 @@ async def do_run_python(
             # connectionless UDP egress (sendto / sendmsg) must not bypass
             "_orig_sendto = _socket.socket.sendto\n"
             "def _sendto(self, *a):\n"
-            "    if len(a) >= 2: _guard(a[1])\n"
+            "    # 2-arg form: sendto(data, address); 3-arg: sendto(data, flags, address)\n"
+            "    _guard(a[2] if len(a) >= 3 else a[1])\n"
             "    return _orig_sendto(self, *a)\n"
             "_socket.socket.sendto = _sendto\n"
-            "_orig_sendmsg = _socket.socket.sendmsg\n"
-            "def _sendmsg(self, buffers, ancdata=(), flags=0, address=None):\n"
-            "    if address is not None: _guard(address)\n"
-            "    return _orig_sendmsg(self, buffers, ancdata, flags, address)\n"
-            "_socket.socket.sendmsg = _sendmsg\n"
+            # sendmsg is Unix-only: guard the patch the way CPython's own
+            # Lib/socket.py does, or every run_python call dies on Windows.
+            "if hasattr(_socket.socket, 'sendmsg'):\n"
+            "    _orig_sendmsg = _socket.socket.sendmsg\n"
+            "    def _sendmsg(self, buffers, ancdata=(), flags=0, address=None):\n"
+            "        if address is not None: _guard(address)\n"
+            "        return _orig_sendmsg(self, buffers, ancdata, flags, address)\n"
+            "    _socket.socket.sendmsg = _sendmsg\n"
             # create_connection and asyncio paths (Proactor ConnectEx bypasses
             # the patched connect — guard before delegating)
             "_orig_ce = _socket.create_connection\n"
@@ -94,7 +99,11 @@ async def do_run_python(
             "import asyncio as _asyncio\n"
             "_orig_occ = _asyncio.open_connection\n"
             "def _open_connection(host, port=None, *a, **kw):\n"
-            "    _guard((host, port))\n"
+            "    # A pre-connected sock (sock=...) is already a patched socket;\n"
+            "    # only guard the host/port form. host=None + sock=None would be\n"
+            "    # invalid anyway.\n"
+            "    if host is not None:\n"
+            "        _guard((host, port))\n"
             "    return _orig_occ(host, port, *a, **kw)\n"
             "_asyncio.open_connection = _open_connection\n"
             "_orig_loop_cc = _asyncio.BaseEventLoop.create_connection\n"
@@ -134,7 +143,8 @@ async def do_run_python(
             "            _spawn_error('os.' + _what)\n"
             "            return _orig(*a, **kw)\n"
             "        setattr(_os, _name, _blocked)\n"
-            "del _socket, _asyncio, _os, _subprocess\n"
+            # _spawn_error reads _os.environ at call time: _os must survive.
+            "del _socket, _asyncio, _subprocess\n"
         )
         code = preamble + code
 
@@ -158,6 +168,12 @@ async def do_run_python(
             # Redirect tempfile defaults so snippet artifacts (downloads,
             # decoded blobs, /tmp-style writes) stay inside this run's dir.
             env["TMP"] = env["TEMP"] = env["TMPDIR"] = str(run_dir)
+        # The subprocess opt-out flag is threaded as an env var the snippet's
+        # preamble reads. Set it explicitly so a stray variable in the parent
+        # environment cannot override the caller's explicit choice.
+        if env is None:
+            env = dict(os.environ)
+        env["RUN_PYTHON_ALLOW_SUBPROCESS"] = "1" if allow_subprocess else "0"
 
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -180,13 +196,16 @@ async def do_run_python(
             except ProcessLookupError:
                 pass
             if sys.platform == "win32":
-                import subprocess as _sp
-
-                _sp.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    capture_output=True,
-                    timeout=15,
-                )
+                try:
+                    killer = await asyncio.create_subprocess_exec(
+                        "taskkill", "/F", "/T", "/PID", str(proc.pid),
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(killer.communicate(), timeout=15)
+                except Exception:
+                    # Best effort: the direct kill above already landed.
+                    pass
             await proc.wait()
             return (
                 f"run_python: timed out after {timeout:.0f}s and the process was killed. "

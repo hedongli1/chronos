@@ -10,8 +10,8 @@ docs/rewrite-plan.md "已拍板"). Operators enable them explicitly:
   no RAG, no embedding, no LLM coordinator (Less-Is-More). Memory is
   self-reported and unverified by design; it is NEVER injected into the system
   prompt, only fetched on explicit recall.
-- FINDINGS_OUTPUT_ENABLED=1: the solver gains `record_finding(evidence,
-  summary, severity)` writing logs/findings-<challenge>.jsonl. This is a pure
+- FINDINGS_OUTPUT_ENABLED=1: the solver gains `record_finding(summary,
+  evidence, severity)` writing logs/findings-<challenge>.jsonl. This is a pure
   observability output ("发现即记录漏洞"), never fed back into scoring.
 """
 

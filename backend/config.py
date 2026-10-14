@@ -137,6 +137,13 @@ class Settings(BaseSettings):
     vpn_health_check_url: str = Field(
         default="http://10.0.100.58", validation_alias=AliasChoices("VPN_HEALTH_CHECK_URL"),
     )
+    # run_python subprocess escape hatch: the target-lock preamble refuses
+    # subprocess/os.exec in snippets by default (children would escape the
+    # socket allowlist). Set 1 to allow (documented gap; operator decision).
+    run_python_allow_subprocess: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("RUN_PYTHON_ALLOW_SUBPROCESS"),
+    )
 
     # Opt-in subsystems (default OFF — see docs/rewrite-plan.md "已拍板"):
     # cross-task memory gives the solver remember/recall_memory tools backed by

@@ -99,6 +99,18 @@ def _solver_trace_path(deps, challenge: str, model: str) -> str | None:
     return getattr(tracer, "path", None)
 
 
+def _queue_put(out: asyncio.Queue, frame: dict) -> None:
+    """Drop-oldest bounded enqueue for trace/state frames (see ws() _put)."""
+    try:
+        out.put_nowait(frame)
+    except asyncio.QueueFull:
+        try:
+            out.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        out.put_nowait(frame)
+
+
 async def _tail_trace(path: str, out: asyncio.Queue, challenge: str, model: str) -> None:
     """Stream a solver's JSONL trace to a queue: backlog first, then new lines."""
     try:
@@ -115,11 +127,11 @@ async def _tail_trace(path: str, out: asyncio.Queue, challenge: str, model: str)
                 else:
                     await asyncio.sleep(0.4)
     except FileNotFoundError:
-        out.put_nowait({"type": "trace_error", "message": f"trace not found: {path}"})
+        _queue_put(out, {"type": "trace_error", "message": f"trace not found: {path}"})
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001
-        out.put_nowait({"type": "trace_error", "message": str(e)})
+        _queue_put(out, {"type": "trace_error", "message": str(e)})
 
 
 def _emit_trace_line(out: asyncio.Queue, line: str, challenge: str, model: str) -> None:
@@ -130,7 +142,7 @@ def _emit_trace_line(out: asyncio.Queue, line: str, challenge: str, model: str) 
         event = json.loads(line)
     except ValueError:
         return
-    out.put_nowait({"type": "trace", "challenge": challenge, "model": model, "event": event})
+    _queue_put(out, {"type": "trace", "challenge": challenge, "model": model, "event": event})
 
 
 # --------------------------------------------------------------------------- #
@@ -163,16 +175,21 @@ def _build_app(deps, cost_tracker):
         out: asyncio.Queue = asyncio.Queue(maxsize=256)
         tail_task: asyncio.Task | None = None
 
+        def _put(frame: dict) -> None:
+            """Bounded enqueue shared by ALL producers: drop the oldest frame
+            when full so a stuck client can never wedge or grow memory."""
+            try:
+                out.put_nowait(frame)
+            except asyncio.QueueFull:
+                try:
+                    out.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                out.put_nowait(frame)
+
         async def pusher() -> None:
             while True:
-                try:
-                    out.put_nowait({"type": "state", **build_snapshot(deps, cost_tracker)})
-                except asyncio.QueueFull:
-                    try:
-                        out.get_nowait()
-                    except asyncio.QueueEmpty:
-                        pass
-                    out.put_nowait({"type": "state", **build_snapshot(deps, cost_tracker)})
+                _put({"type": "state", **build_snapshot(deps, cost_tracker)})
                 await asyncio.sleep(1.0)
 
         async def sender() -> None:
@@ -207,11 +224,10 @@ def _build_app(deps, cost_tracker):
                     _stop_tail()
                     path = _solver_trace_path(deps, challenge, model)
                     if path:
-                        out.put_nowait({"type": "watch_ok", "challenge": challenge, "model": model})
+                        _put({"type": "watch_ok", "challenge": challenge, "model": model})
                         tail_task = asyncio.create_task(_tail_trace(path, out, challenge, model))
                     else:
-                        out.put_nowait({"type": "trace_error",
-                                        "message": f"no live solver {challenge} / {model}"})
+                        _put({"type": "trace_error", "message": f"no live solver {challenge} / {model}"})
 
                 elif kind == "unwatch":
                     _stop_tail()

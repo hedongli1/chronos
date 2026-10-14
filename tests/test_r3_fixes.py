@@ -104,3 +104,42 @@ class TestCostProviderMap:
         assert PROVIDER_MAP.get("qwen") is None
         assert PROVIDER_MAP.get("glm") is None
         assert PROVIDER_MAP.get("deepseek") == "deepseek"
+
+
+class TestR6Regressions:
+    """Lock in fixes for the two regressions R6 caught in the upgrade diff."""
+
+    def test_traced_usage_initializers_are_not_orphaned(self) -> None:
+        """The step_count property must not swallow the _traced_* inits."""
+        from backend.agents.headless_solver import HeadlessSolver
+        from backend.cost_tracker import CostTracker
+        from backend.prompts import ChallengeMeta
+
+        solver = HeadlessSolver(
+            model_spec="deepseek/deepseek-chat",
+            meta=ChallengeMeta(name="c", connection_info="10.0.0.1:80"),
+            platform=object(),  # type: ignore[arg-type]
+            cost_tracker=CostTracker(),
+            settings=object(),
+        )
+        for attr in (
+            "_traced_input_tokens", "_traced_output_tokens",
+            "_traced_cache_tokens", "_traced_cost",
+        ):
+            assert hasattr(solver, attr), f"missing {attr} — property swallowed __init__ lines"
+        assert solver._traced_input_tokens == 0
+        assert solver.step_count == 0
+
+    def test_run_python_preamble_is_windows_safe(self) -> None:
+        """sendmsg is Unix-only: the generated guard must not reference it
+        unconditionally, and _os must survive for _spawn_error."""
+        import inspect
+
+        from backend.tools import local_exec
+
+        src = inspect.getsource(local_exec.do_run_python)
+        # the preamble lives inside do_run_python's body as string literals
+        assert "hasattr(_socket.socket, 'sendmsg')" in src
+        assert "del _os" not in src
+        # taskkill must not run synchronously in the async path
+        assert "subprocess.run(" not in src or "taskkill" not in src

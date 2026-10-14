@@ -471,7 +471,10 @@ class ChallengeSwarm:
                 pass
             if self.pause_event.is_set():
                 # Operator paused this swarm deliberately — the stall clock
-                # must not withdraw a paused challenge out from under them.
+                # must not withdraw a paused challenge, and paused time must
+                # not count against the stall window: keep re-anchoring the
+                # progress timestamp so the window restarts on resume.
+                self._last_progress_monotonic = time.monotonic()
                 continue
             if (
                 self._last_progress_monotonic
