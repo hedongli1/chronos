@@ -4,15 +4,19 @@ version = "0.1.0"
 description = "Agentic offensive security — TSecBench headless solver swarm"
 requires-python = ">=3.14"
 dependencies = [
-    "pydantic-ai[openai]",
-    "pydantic-settings",
-    "genai-prices",
-    "httpx",
-    "pyyaml",
-    "rich",
-    "click",
-    "fastapi",
-    "uvicorn[standard]",
+    # Lower bounds = versions this branch was developed and verified against;
+    # exact pins live in uv.lock (committed, reproducible installs).
+    "pydantic-ai>=2.56.0",
+    "openai>=3.30.0",
+    "pydantic-settings>=2.15.0",
+    "genai-prices>=0.1.11",
+    "httpx>=0.28.1",
+    "httpx2>=2.13.1",
+    "pyyaml>=6.0.3",
+    "rich>=15.0.0",
+    "click>=8.5.0",
+    "fastapi>=0.143.0",
+    "uvicorn[standard]>=0.54.0",
 ]
 
 [project.scripts]
@@ -27,10 +31,10 @@ package = true
 
 [dependency-groups]
 dev = [
-    "pytest>=9.0",
-    "pytest-asyncio>=1.3",
-    "ruff>=0.14",
-    "ty>=0.0.2",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.17.0",
+    "ty>=0.0.87",
 ]
 
 [tool.hatch.build.targets.wheel]

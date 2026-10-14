@@ -126,6 +126,13 @@ uv run ctf-solve --web --web-port 9000
 
 自由文本不再有 LLM 接收，会被忽略。
 
+### Opt-in 子系统（默认全部关闭）
+
+以下能力默认关闭，对 TSecBench 跑分不产生任何行为差异（见 [`docs/rewrite-plan.md`](docs/rewrite-plan.md) "已拍板"）：
+
+- **跨任务记忆**（`--cross-task-memory` / `CROSS_TASK_MEMORY_ENABLED=1`）：solver 获得 `remember(text)` / `recall_memory(query)` 两个工具，把可复用技巧写入 `logs/cross-task-memory.jsonl` 并按需召回。召回是纯字符串匹配（无 RAG、无 LLM 协调）；记忆永不自动注入系统提示词，只按显式 recall 返回。
+- **漏洞产物输出**（`--findings-output` / `FINDINGS_OUTPUT_ENABLED=1`）：solver 获得 `record_finding(summary, evidence, severity)` 工具，把漏洞/凭据/立足点写入 `logs/findings-<题目>.jsonl`。纯观测产物，不接评分通道。
+
 ### Swarm 与 Solver
 
 一道题对应一个 swarm，可包含多个同构 solver 并行竞速；任一 solver 确认全部 flag 即取消其余。solver 卡住（GAVE_UP/ERROR）时会被注入兄弟 agent 的发现继续（bump，最多 5 次）。
@@ -161,6 +168,8 @@ uv run ctf-solve [OPTIONS]
 --total-budget-seconds N    全局总预算（默认关闭；设置后钳制单题时限 + 预算告急停止开新题）
 --no-submit                 干跑，不提交 flag
 --no-exec                   禁用 run_python
+--cross-task-memory         开启跨任务记忆工具（remember/recall_memory，默认关）
+--findings-output           开启漏洞产物输出工具（record_finding，默认关）
 --smoke-test / --model-smoke-test
 --web                       启动 Web 控制台（可视化 + 操控 + 盯 solver / 对话）
 --web-host / --web-port     Web 控制台监听地址（默认 127.0.0.1:8000）
@@ -171,11 +180,15 @@ uv run ctf-solve [OPTIONS]
 ## 目录结构
 
 - `backend/`：机械调度器、headless solver、TSecBench 平台适配器、中性工具
+- `backend/memory.py`：opt-in 跨任务记忆 + findings 产物记录（默认关闭）
 - `backend/web.py` + `backend/webui/`：Web 控制台（FastAPI 服务 + 单页前端）
+- `tests/`：隔离单元测试（mock 平台/模型，不触网，`python -m uv run pytest`）
 - `challenges/`：拉取后的题目元数据
-- `logs/`：trace 日志与运行记录
+- `logs/`：trace 日志、跨任务记忆、findings 记录、运行分析报告
 - `.ctf-state/`：run_python 的 per-run 工作区
 - `docs/rewrite-plan.md`：设计基线与删/留取舍
+- `docs/upgrade-rounds.md`：升级轮次记录与门禁状态
+- `docs/audit-r1.json`：R1 全量审计的 94 条缺陷清单（逐条含修复去向）
 
 ## 运行环境要求
 

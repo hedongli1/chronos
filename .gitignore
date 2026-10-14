@@ -23,7 +23,7 @@ build/
 pytest-cache-files-*/
 .test-tmp/
 test-output/
-uv.lock
+# uv.lock is COMMITTED for reproducible installs (do not ignore it).
 
 # Runtime
 workspace/
