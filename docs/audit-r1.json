@@ -1,0 +1,892 @@
+[
+ {
+  "file": "backend/agents/coordinator_loop.py",
+  "line": 299,
+  "severity": "high",
+  "category": "correctness",
+  "summary": "An empty/unavailable challenge list is interpreted as 'all solved', so a failed initial poll ends the run instantly with an empty result set and no error.",
+  "detail": "Termination test is `unsolved_set = poller.known_challenges - poller.known_solved; active_now = any(...); if not unsolved_set and not active_now and not deps.pending_spawns: break` (lines 297-301). `PlatformPoller._seed` swallows every exception from the first fetch (`except Exception as e: logger.warning(\"Initial poll error: %s\", e)`, poller.py:55-56), and `TSecBenchmarkPlatform.fetch_all_challenges` returns `[]` for any non-fatal HTTP/parse failure while raising RuntimeError only for the deliberate fatal states 'already finished'/'task_not_found' (tsec_platform.py:122-131). So when the very first poll fails (bad/expired token, VPN down, transient 5xx) or the platform reports zero challenges at start, `known_challenges` is empty and the first loop iteration logs 'All challenges solved; scheduler exiting.', `run_scheduler` returns `{'results': {}, 'total_cost_usd': 0, ...}`, and `cli._run_coordinator` prints 'Final Results:' plus a zero-cost summary as if the benchmark completed. The adapter author's explicit intent ('must NOT be mistaken for zero challenges — surface them instead') is defeated at the scheduler level.",
+  "fix_hint": "Require positive evidence of one successful poll before the termination check: set a `seen_challenges` flag only when `_seed`/`_poll_once` complete without exception (propagate the adapter's fatal-state RuntimeError instead of logging it away), and only break when a non-empty challenge set was observed at least once; otherwise exit/raise so the CLI reports failure.",
+  "evidence": "Confirmed. coordinator_loop.py:297-301: `unsolved_set = poller.known_challenges - poller.known_solved; ... if not unsolved_set and not active_now and not deps.pending_spawns: break` - an empty initial set fires on the first iteration, logging 'All challenges solved; scheduler exiting.' (:300) and returning results {}/cost 0 (:328-332), which cli._run_coordinator prints as a normal 'Final Results'. poller.py:48-56 swallows every exception from the first fetch, and tsec_platform.py:124-131 returns [] on non-fatal failures (the deliberate fatal states at :122-123 also raise into _seed's except). The CLI preflight (cli.py:61-76) catches bad-token/finished-task at startup, but transient first-poll failures and a zero-challenge payload still end the run silently as a false success."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 126,
+  "severity": "high",
+  "category": "safety",
+  "summary": "Lock fails open on an empty parsed hostname, and do_raw_http's scheme-prepending silently re-targets '//host' and '/host' URLs to that host.",
+  "detail": "`h = (host or \"\").strip().lower(); if not h or h in deps.allowed_hosts: return None` treats an empty hostname as allowed. `http_request(\"//10.0.3.9/x\")` -> headless_solver.py:159 `urlparse(\"http:////10.0.3.9/x\").hostname is None` -> host \"\" -> no block; then net_tools.py:46-47 `url = \"http://\" + url.lstrip(\"/\")` rewrites the request to `http://10.0.3.9/x`, which httpx fetches — an off-scope request with no lock check at all. A relative-looking call such as `http_request(\"/admin\")` becomes a request to `http://admin/` (another VPN name) instead of the intended target, so the failure is both a bypass and a silent re-targeting. Nothing else re-validates the URL after the tool's pre-check.",
+  "fix_hint": "Reject an empty hostname in _target_lock_block (never allow `not h`), and in do_raw_http refuse URLs without an explicit host instead of stripping '/'-prefixes; normalize the URL once in the tool and pass both the parsed URL and its host to the fetch.",
+  "evidence": "backend/agents/headless_solver.py:125-126: `h = (host or \"\").strip().lower()` / `if not h or h in deps.allowed_hosts: return None` — an empty/unparseable host is allowed (fail-open) even when allowed_hosts is configured (block-all only when the set is empty, line 115). The URL path: line 159 `host = urlparse(url if \"://\" in url else f\"http://{url}\").hostname or \"\"` is the single check (161-167), then `return await do_raw_http(...)`. net_tools.py:46-47 `url = \"http://\" + url.lstrip(\"/\")`: urlparse(\"http:////10.0.3.9/x\").hostname is None → check skipped → lstrip('/') rewrites it to \"http://10.0.3.9/x\" (chained lstrip even strips leading 'h' chars of relative inputs like 'http:...'); a relative URL \"/admin\" becomes \"http://admin\". Nothing re-validates after this transformation, so the lock is bypassable by the solver's own input, directly contradicting prompts.py:137-138."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 226,
+  "severity": "high",
+  "category": "safety",
+  "summary": "`--no-submit` dry-run is broken end-to-end: real flags are submitted while the coordinator logs \"DRY RUN\"",
+  "detail": "The submit tool's dry-run guard `if ctx.deps.no_submit:` (line 226, mirrored in `_submit_final_output_candidate` at 509) reads `HeadlessDeps.no_submit` (backend/deps.py:35, default False), which is never set: `HeadlessDeps(...)` is constructed at lines 346-363 without `no_submit`, and `HeadlessSolver.__init__` has no such parameter. The CLI does thread the flag as far as the swarm (backend/cli.py:295; coordinator_core.py:118), and `ChallengeSwarm.no_submit` exists (backend/agents/swarm.py:81) — but that line is the only occurrence of `no_submit` in swarm.py: `_create_solver` (swarm.py:139-152) never passes it down and `try_submit_flag` (swarm.py:186) never checks it, so `submit_fn` hits the live platform. Meanwhile coordinator_core.py:128 records `\"submit\": \"DRY RUN\" if deps.no_submit else ...` into the results. Net: with `--no-submit`, both solver-side guards are dead code and real submissions are made — the opposite of the requested contract.",
+  "fix_hint": "Thread `no_submit` from `ChallengeSwarm` into `HeadlessSolver.__init__` and set `HeadlessDeps(no_submit=...)` (or enforce it at the top of `ChallengeSwarm.try_submit_flag`, returning `(f'DRY RUN — would submit \"{flag}\"', False)`), and add a test asserting no platform call is made under `--no-submit`.",
+  "evidence": "Confirmed. headless_solver.py:226 `if ctx.deps.no_submit:` (mirror at :509) reads HeadlessDeps.no_submit, which nothing ever sets: deps.py:35 `no_submit: bool = False`; the HeadlessDeps construction (headless_solver.py:346-363) passes no such field and HeadlessSolver.__init__ (317-332) has no parameter for it. swarm.py:81 `no_submit: bool = False` is the only occurrence of the identifier in swarm.py; _create_solver (138-152) never forwards it and try_submit_flag reaches `result = await self.platform.submit_flag(self.meta.name, flag)` (:245). coordinator_core.py:128 still records '\"submit\": \"DRY RUN\" if deps.no_submit else \"confirmed by solver\"', and README.md:161 documents --no-submit as a dry run. Both solver-side guards are dead code and real submissions occur."
+ },
+ {
+  "file": "backend/agents/swarm.py",
+  "line": 81,
+  "severity": "high",
+  "category": "safety",
+  "summary": "--no-submit dry-run is not wired to solvers: flags are submitted for real",
+  "detail": "ChallengeSwarm.no_submit is set by every caller (coordinator_core.py:118, cli.py:289-296) but never used inside the class: _create_solver() (swarm.py:138-152) does not forward it, HeadlessSolver.__init__ has no no_submit parameter (headless_solver.py:318-333), and HeadlessDeps.no_submit therefore stays False (deps.py:35). The dry-run guards at headless_solver.py:226 and :509 never fire, and try_submit_flag posts to the platform at swarm.py:245. coordinator_core.py:128 even labels the recorded result 'DRY RUN'. A run advertised as no-submit sends real flags and consumes the platform's wrong-answer budget.",
+  "fix_hint": "Thread it through: _create_solver -> HeadlessSolver(no_submit=self.no_submit) -> HeadlessDeps.no_submit; add a defence-in-depth early return in try_submit_flag when self.no_submit is set.",
+  "evidence": "Confirmed - same root cause as the headless_solver.py:226 finding. swarm.py:81 `no_submit: bool = False` is never read anywhere in the file (grep: it is the only occurrence in swarm.py); callers set it (cli.py:295, coordinator_core.py:118) but `_create_solver` (:138-152) does not forward it and HeadlessSolver/HeadlessDeps never receive it (headless_solver.py:317-332, 346-363; deps.py:35 stays False). The :226/:509 guards never fire and swarm.py:245 posts real flags to the live platform."
+ },
+ {
+  "file": "backend/agents/swarm.py",
+  "line": 273,
+  "severity": "high",
+  "category": "correctness",
+  "summary": "Non-definitive submit statuses ('unknown' infra errors) are counted as wrong guesses and can trip the swarm-wide circuit breaker",
+  "detail": "After the platform call only 'already_solved' (swarm.py:249) and 'correct' (swarm.py:256) are special-cased; every other status falls through to the wrong-submission accounting at swarm.py:273-279, which increments _submit_count/_wrong_total and at _wrong_total >= SUBMIT_LOCK_WRONG_LIMIT (4, swarm.py:184) sets _submit_locked and cancels the entire swarm with reason 'circuit_breaker' (swarm.py:276-284). TSecBenchmarkPlatform.submit_flag returns SubmitResult('unknown', ...) for challenge-not-found (tsec_platform.py:188), invalid_state (tsec_platform.py:230) and any non-duplicate HTTPStatusError (tsec_platform.py:234) — i.e. transient platform/VPN errors are indistinguishable from guessed flags. Four such errors stand the swarm down exactly as if four flags had been guessed, and each affected flag stays burned in _submitted_flags.",
+  "fix_hint": "Branch on all statuses explicitly: treat 'unknown'/infra errors as retryable (return an error display, do not touch _submit_count/_wrong_total/_last_submit_time, and discard the flag from _submitted_flags); only 'incorrect' may feed the circuit breaker.",
+  "evidence": "Confirmed. swarm.py special-cases only 'already_solved' (:249) and 'correct' (:256); every other status falls through to :273-279, which increments _submit_count/_wrong_total and at >= 4 (:184, :276-284) sets _submit_locked and cancels the swarm with 'circuit_breaker'. TSecBenchmarkPlatform.submit_flag returns status 'unknown' for challenge-not-found (tsec_platform.py:187-191), invalid_state (:228-233) and any non-duplicate HTTPStatusError (:234), so four transient platform/infra errors stand the swarm down exactly like four guessed flags, and each affected flag stays burned in _submitted_flags."
+ },
+ {
+  "file": "backend/poller.py",
+  "line": 79,
+  "severity": "high",
+  "category": "concurrency",
+  "summary": "`get_event` catches `asyncio.CancelledError` and returns None, so cancelling the scheduler task is silently discarded and shutdown hangs.",
+  "detail": "`try: return await asyncio.wait_for(self._event_queue.get(), timeout=timeout) except (TimeoutError, asyncio.CancelledError): return None` (lines 75-80). `run_event_loop` awaits this once per ~1s iteration (coordinator_loop.py:206), so an external cancellation almost always lands here and is swallowed; the `while True` then continues polling and spawning. Concretely, `run_web_scheduler` shuts down with `if not scheduler_task.done(): scheduler_task.cancel()` followed by `with contextlib.suppress(...): await scheduler_task` (web.py:277-281) — the await blocks indefinitely because the task never acknowledges the cancel, so closing the web console leaves the scheduler running with containers still being opened. Likewise the first Ctrl+C under `asyncio.run` cancels the main task and waits for it; since the cancellation is eaten, the interrupt appears to do nothing and only a second signal force-kills the process, skipping the clean-shutdown path at coordinator_loop.py:303-326.",
+  "fix_hint": "Swallow only the timeout (`except TimeoutError: return None`) and let `asyncio.CancelledError` propagate; if callers need a non-raising variant, expose a separate method or a `stopped` flag rather than aliasing cancellation with timeout.",
+  "evidence": "backend/poller.py:75-80: `async def get_event(...): try: return await asyncio.wait_for(self._event_queue.get(), timeout=timeout) / except (TimeoutError, asyncio.CancelledError): return None` — a CancelledError delivered while the scheduler task is parked on the dominant await (coordinator_loop.py:206 `evt = await poller.get_event(timeout=1.0)`) is swallowed and converted to a normal None return, so the `while True` loop keeps ticking and the outer handler at coordinator_loop.py:303 (`except (KeyboardInterrupt, asyncio.CancelledError)`) never sees it. backend/web.py:277-281: `if not scheduler_task.done(): scheduler_task.cancel()` then `with contextlib.suppress(asyncio.CancelledError, Exception): await scheduler_task` — the guard-await can never complete while the task keeps looping, so console shutdown blocks. Python 3.14 stdlib confirms: asyncio/timeouts.py __aexit__ converts to TimeoutError only when the timeout itself expired; an external Task.cancel propagates as CancelledError into the except clause and, once caught, the task is no longer cancelled (asyncio/tasks.py wait_for docstring: 'If the task suppresses the cancellation and returns a value instead, that value is returned')."
+ },
+ {
+  "file": "backend/tools/net_tools.py",
+  "line": 61,
+  "severity": "high",
+  "category": "safety",
+  "summary": "Target lock is bypassed by HTTP redirects: httpx follows 3xx to any host, and the lock is only checked on the initial URL.",
+  "detail": "headless_solver.py:159-167 runs `_target_lock_block` once on the original URL, then calls `do_raw_http`, which builds `httpx.AsyncClient(verify=False, timeout=timeout, follow_redirects=True, trust_env=False)` (net_tools.py:58-63). There is no allowlist parameter on `do_raw_http` and no re-check of `resp.url`, so a `302 Location: http://10.0.3.9/` served by an in-scope target is fetched automatically; the transcript even prints the off-scope `URL: {resp.url}` (net_tools.py:68) only after the fact. This violates the code's own invariant ('the solver's own egress is always restricted to the hosts parsed from this task's connection_info', headless_solver.py:103-107) and the prompt promise at prompts.py:137-138 ('http_request, tcp_send ... to any other host are blocked'). It is also the exact drift scenario the fail-loud lock was added for (c-03 incident).",
+  "fix_hint": "Set follow_redirects=False and implement the redirect loop explicitly in do_raw_http, re-running the host check (per-hop allowlist callback passed from the tool, or an httpx event hook that raises on a non-allowed request URL); return the transcript with a 'redirect blocked' note when a Location points off-scope.",
+  "evidence": "backend/tools/net_tools.py:58-63: `httpx.AsyncClient(verify=False, timeout=timeout, follow_redirects=True, trust_env=False)` — redirects are followed to arbitrary hosts with no per-hop allowlist re-check, and line 68 echoes `f\"URL: {resp.url}\"` back (final URL only). do_raw_http/do_tcp_send have no allowlist parameter (signature at net_tools.py:33-39) and grep shows they are only called from headless_solver.py (41, 167, 190), where the host is validated once before the call (headless_solver.py:159-167). A redirect emitted by any in-scope target therefore silently reaches an out-of-scope host, violating the target lock the system prompt promises at prompts.py:137-138 ('A target lock is enforced: http_request, tcp_send, and run_python socket connections to any other host are blocked') and the c-03 safety invariant."
+ },
+ {
+  "file": "backend/agents/coordinator_core.py",
+  "line": 134,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "`steps` is always 0 for every non-flag outcome, so `EARLY_EXIT_MIN_STEPS` never discriminates: every failed swarm is mislabeled a startup failure and given a full second attempt.",
+  "detail": "`steps = result.step_count if result else 0` — but `result` comes from `_run_swarm_with_time_limit`, which returns `run_task.result()` from `ChallengeSwarm.run()`. That method drops all non-FLAG_FOUND solver results (`for task in done: ... if result and result.status == FLAG_FOUND: return result`, then `tasks = list(pending)`) and finally executes `return self.winner` (swarm.py:459-462), which is None whenever no model found a flag. Therefore every failure that is not the wall-clock timeout (all solvers gave up, submit circuit-breaker `cancel_with_reason('circuit_breaker')`, stall watchdog withdrawal, error exits) reaches line 134 with `result is None`, so `steps < EARLY_EXIT_MIN_STEPS` (line 135) is unconditionally true: a swarm that consumed its entire 30-minute budget is logged as 'Early exit after 0 steps ... (likely a transient startup problem)', pushed to the coordinator inbox as such, added to `early_retried`, and given a second full-length run — doubling cost/time per failed challenge while the constant at line 22 and the per-solver `SolverResult.step_count` are dead in this path.",
+  "fix_hint": "Carry a real step count out of the swarm: return the best non-win `SolverResult` from `ChallengeSwarm.run()` (or store `max(step_count)` across solvers on the swarm), and compare that here; alternatively read `max(a['step_count'] for a in swarm.get_status()['agents'].values())` before deciding to retry.",
+  "evidence": "backend/agents/coordinator_core.py:134 `steps = result.step_count if result else 0`, then 135 `if steps < EARLY_EXIT_MIN_STEPS ...`. `result` comes from `run_task.result()` (line 171-172) of ChallengeSwarm.run(). swarm.py:452-457 returns a result only in the FLAG_FOUND branch; otherwise swarm.py:461-462 `self.cancel_event.cancel_with_reason(\"swarm_complete\") / return self.winner`, and `self.winner = result` is assigned only at swarm.py:341 inside the FLAG_FOUND branch. So every non-flag finish (stall/gave-up/circuit-breaker/error) yields None → steps is always 0 → the retry branch fires unconditionally, ignoring EARLY_EXIT_MIN_STEPS (line 22), while SolverResult.step_count is in fact populated (headless_solver.py:592 `step_count=self._step_count[0]`). The early-exit logic is effectively 'retry every failed swarm once', contradicting README.md:46's '<15 steps' (步数过少) contract."
+ },
+ {
+  "file": "backend/agents/coordinator_core.py",
+  "line": 211,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "Capacity accounting has two disagreeing sources of truth, and `open_containers` entries are never revalidated, so one failed container close permanently burns a local slot.",
+  "detail": "`_recover_challenge_environment` returns early with 'keeping it counted' whenever `release_challenge` yields False (lines 204-216), and nothing ever retries the release or reconciles the set — `deps.open_containers` is only added at line 106 and discarded at line 217. A transient close failure therefore permanently reduces capacity: `do_spawn_swarm` gates on `active_count = len(deps.open_containers) + len(deps.pending_spawns)` (lines 52-53), so with TSec's 3-container cap, three such failures make every later spawn return 'At capacity (...)' for the rest of the run, and even the ghost reap (lines 85-102, which can close any challenge not in `running|pending|{challenge}`) never removes the name from the set. In the opposite direction, `_auto_spawn_one` (lines 479-483) and `_auto_spawn_unsolved` (lines 523-527) count only `swarm_tasks` + `pending_spawns`, so the scheduler keeps selecting 'free' slots, receives a refusal string from `do_spawn_swarm`, logs it as `Auto-spawn X: At capacity ...` (line 504), and resets spawn_failures. The adapter also under-counts: `release_challenge` ignores `close_challenge`'s `{'closed': resp.get('closed', True)}` result (tsec_platform.py:398-400 with release at 307-322), so a 200 response with `closed: False` is reported as a successful release and the name is discarded from `open_containers` while the range is still live.",
+  "fix_hint": "Make one accounting source of truth (derive the scheduler's slot math from `open_containers | pending_spawns` too), re-attempt release or reconcile against the platform's `container_status` before keeping an entry counted, have the ghost reaper discard the names it closed, and have `release_challenge` return False when the payload says `closed: False`.",
+  "evidence": "backend/agents/coordinator_core.py:211-217: `if released is False: logger.warning('Container for %s may still occupy a platform slot; keeping it counted', ...); return` / `deps.open_containers.discard(challenge_name)` — on release failure the name stays counted forever; grep shows open_containers is only mutated at line 106 (add) and 217 (discard). The ghost-reap path (coordinator_core.py:85-102) closes platform-side but never reconciles this set, and the capacity gate `len(deps.open_containers) + len(deps.pending_spawns)` (lines 52-53) plus scheduler predicates (coordinator_loop.py:479-483, 523-527, which ignore open_containers) rely on it. tsec_platform.py:398-400 returns `{'closed': resp.get('closed', True)}` but release_challenge (307-322) ignores the dict and returns True on no-exception, so a `closed: False` answer is invisible. Three such failures wedge every later spawn at 'At capacity' for the rest of the run."
+ },
+ {
+  "file": "backend/agents/coordinator_loop.py",
+  "line": 145,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "`--benchmark-base-url` silently has no effect: the platform adapter prefers platform_url, whose default is always non-empty.",
+  "detail": "`base = settings.platform_url or settings.benchmark_url` (backend/agents/coordinator_loop.py:145). platform_url has a non-empty default 'https://tsecbench.zc.tencent.com' (backend/config.py:12-15), so the fallback never triggers; the CLI flag --benchmark-base-url only assigns `settings.benchmark_url` (backend/cli.py:87, 152-153) while the startup banner still prints it as the connection target (backend/cli.py:182), so an operator who redirects the run to another host via that flag keeps hitting the old one. The token side is the same trap that happens to work: `settings.platform_token or settings.benchmark_token` (coordinator_loop.py:146) only falls through because platform_token defaults to ''. Note both PLATFORM_* and BENCHMARK_* aliases feed the same URL field (backend/config.py:14 and :60), which is why the env route works but the flag route cannot.",
+  "fix_hint": "Unify on one field/flag pair, or make --benchmark-base-url/--benchmark-token write settings.platform_url/settings.platform_token (or apply them in _create_platform).",
+  "evidence": "Claim matches the code. coordinator_loop.py:145 `base = settings.platform_url or settings.benchmark_url`, and platform_url has a non-empty default `\"https://tsecbench.zc.tencent.com\"` (config.py:12-15), so the fallback never fires. `--benchmark-base-url` writes only `settings.benchmark_url` (cli.py:152-153), which feeds the banner (cli.py:182) and the VPN check (cli.py:209) but not the platform adapter. The env route works only because `BENCHMARK_BASE_URL` is also an alias of platform_url (config.py:14 vs :60); the token side (`settings.platform_token or settings.benchmark_token`, coordinator_loop.py:146) works because platform_token defaults to '' (config.py:16-19)."
+ },
+ {
+  "file": "backend/agents/coordinator_loop.py",
+  "line": 151,
+  "severity": "medium",
+  "category": "missing-test",
+  "summary": "The scheduler subsystem has zero tests despite being pure mechanical logic where every rule above is a silent-behavior regression risk.",
+  "detail": "There is no `tests/` directory and no `test_*.py`/`conftest.py` anywhere in the repo (verified by find excluding .venv/.git), while pyproject.toml declares pytest/pytest-asyncio dev deps and docs/upgrade-rounds.md schedules an 'R4 test base'. The uncovered logic is exactly the fragile part: the two divergent capacity predicates (coordinator_core.py:52-53 vs coordinator_loop.py:479-483, 523-527), the early-exit retry bookkeeping (coordinator_core.py:130-147, currently unreachable in its intended form because steps is always 0), the deadlock timer math (coordinator_loop.py:446-471), spawn-failure deferral (coordinator_loop.py:500-514), REPL `__bump__` parsing (coordinator_loop.py:405-425), poller sanity/cancellation (poller.py:75-117) and the termination condition (coordinator_loop.py:297-301).",
+  "fix_hint": "Add pytest-asyncio unit tests with a stub `CompetitionPlatform` and stub swarm: (a) capacity refuses at max and counts deferred containers; (b) a no-result swarm that ran more than EARLY_EXIT_MIN_STEPS is deferred, not retried; (c) deadlock fires only when unsolved is a subset of deferred and never clears operator-stopped entries; (d) poller skips empty/partial snapshots and propagates cancellation; (e) malformed `__bump__` payloads never propagate; (f) a failing initial poll does not report 'all solved'.",
+  "evidence": "No test files exist anywhere outside .venv/.git: `find . -name 'test_*.py' -o -name '*_test.py'` and a check for `tests/`/`conftest.py` return nothing, despite pyproject.toml:29-31 declaring `pytest>=9.0`, `pytest-asyncio>=1.3` dev deps, and docs/upgrade-rounds.md:30 listing the R4 deliverable '测试基座（全模块 pytest 套件）'. The cited fragile paths (concurrency-accounting comparisons at coordinator_core.py:52-53 vs coordinator_loop.py:479-483/523-527, step-based early-exit coordinator_core.py:130-147, deadlock detection coordinator_loop.py:446-471, spawn-failure counter 500-514, REPL __bump__ parsing 405-425, poller.get_event/poll-sanity poller.py:75-117, termination condition coordinator_loop.py:297-301) are all unprotected."
+ },
+ {
+  "file": "backend/agents/coordinator_loop.py",
+  "line": 449,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "Deadlock test compares raw `deferred_challenges` size to unsolved count, so stale/operator-stopped entries can fake a deadlock; auto-resume then silently clears operator `/kill` deferrals.",
+  "detail": "`and len(deps.deferred_challenges) >= len(unsolved_set)` mixes universes: `deferred_challenges` is never pruned when a challenge is solved or vanishes (entries are removed only by `/resume` at line 369/373 or by the auto-resume `clear()` at line 461), so solved challenges keep inflating the left side. Example: `unsolved={A}`, `deferred_challenges={S, T}` where S/T are already solved, and A's first spawn attempt just raised (spawn_failures[A]==1, A not in deferred, `active`/`preparing` empty because `_auto_spawn_unsolved` already returned). `2 >= 1` is true, so lines 455-457 start the idle timer and after `auto_resume_idle_seconds` line 461 executes `deps.deferred_challenges.clear()`, wiping deliberate 'stopped by operator' entries written by `_handle_kill` (line 397) and 'time limit reached' deferrals even though nothing was stalled. The condition that matches the intended 'all unsolved are deferred' is set containment.",
+  "fix_hint": "Use `unsolved_set <= deps.deferred_challenges.keys()`; prune deferred entries for challenges present in `known_solved`, and tag operator-initiated deferrals so the auto-resume `clear()` can preserve them (or make auto-resume re-enable only spawn-failure/time-limit reasons).",
+  "evidence": "backend/agents/coordinator_loop.py:449 `and len(deps.deferred_challenges) >= len(unsolved_set)` — a count comparison, not containment: a stale deferred entry for an already-solved (or never-unsolved) challenge inflates the left side. Deferred entries are removed only at lines 369/373 (_handle_resume) and line 461 (`deps.deferred_challenges.clear()`); nothing prunes them when a challenge is solved (grep confirms). Lines 455-461 then `deps.deferred_challenges.clear()` and resume everything — wiping operator 'stopped by operator' deferrals (line 397) and time-limit deferrals, which is exactly what the count check was meant to protect."
+ },
+ {
+  "file": "backend/agents/coordinator_loop.py",
+  "line": 503,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "`spawn_failures` is reset by non-error refusals and never cleared on re-enable, so the 'defer after 2 consecutive failures' policy cannot work as written.",
+  "detail": "`deps.spawn_failures.pop(challenge_name, None)` (line 503) executes after ANY normal return of `do_spawn_swarm`, including the refusal strings 'At capacity (...)', 'Swarm still running', 'Swarm is already being prepared', 'Challenge ... is deferred' and 'Challenge ... not found on platform' (coordinator_core.py:37-57, 76); only exceptions increment the counter (lines 509-513). The intended scenario in the comment (ghost containers cause capacity walls) alternates exactly like that: a `/start` failure raises (fails=1), the next tick returns a normal 'At capacity' refusal (counter reset to 0), so `fails >= 2` is never reached and the challenge is re-attempted every refill tick, each attempt paying a full `fetch_all_challenges` plus the `/start` retry loop. Conversely nothing clears the counter when the challenge is re-enabled: after deferral at fails==2, a later `/resume` (lines 373-386) or the auto-resume `clear()` gives the challenge exactly one attempt before it is re-deferred as 'spawn failed 3x'; the `/resume` branch also prints 'Re-enabled deferred challenge' unconditionally even when `_auto_spawn_one` immediately refuses for capacity or budget.",
+  "fix_hint": "Distinguish 'spawned' from 'refused' (exception or a structured return), only pop the failure counter on a genuine spawn, and clear `deps.spawn_failures.pop(name, None)` inside `_handle_resume` and the auto-resume path; report the real spawn outcome in the operator message.",
+  "evidence": "backend/agents/coordinator_loop.py:500-503: `result = await do_spawn_swarm(deps, challenge_name)` then `deps.spawn_failures.pop(challenge_name, None)` on ANY normal return — including the refusals 'At capacity ...' / 'Swarm still running for ...' / already-deferred / not-found (coordinator_core.py:37-57 and 76). Only the except branch (509-513) increments `deps.spawn_failures`, so one exception after a /resume immediately re-defers the challenge as 'spawn failed 3x', and /resume's log at line 386 prints 'Re-enabled' unconditionally without resetting or reporting the stale fail count."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 87,
+  "severity": "medium",
+  "category": "missing-test",
+  "summary": "Zero tests exist in the repo; the scope boundary (_parse_allowed_hosts/_target_lock_block) has no coverage, and the IPv6 parse defect above would be caught by one table-driven test.",
+  "detail": "`find . -name \"test*\"` (excluding .venv) returns nothing even though pyproject [dependency-groups] declares pytest>=9/pytest-asyncio>=1.3. _parse_allowed_hosts (line 87) and _target_lock_block (line 101) are the enforcement point for every network tool and have several documented quirks (IPv6/bracket parsing, empty-host fail-open, lowercase/set dedupe); none is exercised by a test, so regressions here are silent until a task fails or drifts.",
+  "fix_hint": "Add unit tests: connection_info parsing table (ip:port, url/path, [v6]:port, bare v6, duplicates, case), lock decisions for empty host, allowed/denied hosts, degraded empty-set state, and the '//host' URL bypass.",
+  "evidence": "Claim matches the repo state. pyproject.toml:30-31 declares `\"pytest>=9.0\"` / `\"pytest-asyncio>=1.3\"`, yet `find . -name 'test*'` excluding .venv and `git ls-files | grep -i test` both return nothing: no tests/ dir, no conftest.py, no pytest config. The enforcement surface `_parse_allowed_hosts` (headless_solver.py:87-98) and `_target_lock_block` (101-134, incl. the `if not h or h in deps.allowed_hosts: return None` at L126) is entirely unexercised, so the real parser defect in finding 3 and any future regression here stay silent."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 286,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "`task_status` reports a frozen accepted-flag count, contradicting the prompt's ground-truth instruction and inviting duplicate resubmissions",
+  "detail": "`progress = f\"{ctx.deps.flags_accepted}/{ctx.deps.flags_total} flags accepted\"` (line 286) reads counters fixed once at construction (`flags_accepted=meta.correct_flag_count`, line 359) that nothing ever increments — the confirmed branch of the submit tool (line 241) and `_submit_final_output_candidate` (line 531) only set `confirmed_flag`, and a repo-wide grep shows no other writer of `flags_accepted`. The prompt (backend/prompts.py:172-173) orders: \"Treat task_status as ground truth after each submit_flag: if the accepted count did not rise, the flag was not accepted\". So a genuinely accepted flag looks unaccepted, and the model is pushed to re-submit (which the swarm dedups into \"INCORRECT — already tried this exact flag.\") or to keep burning budget on a solved flag.",
+  "fix_hint": "Increment `deps.flags_accepted` (bounded by `flags_total`) whenever a submission returns confirmed/ALREADY SOLVED, or have `task_status` return live platform counts; keep the prompt instruction only if the number can actually move.",
+  "evidence": "Confirmed. headless_solver.py:286 `progress = f'{ctx.deps.flags_accepted}/{ctx.deps.flags_total} flags accepted'` reads a field written only once at construction (:359 `flags_accepted=meta.correct_flag_count`; deps.py:43 default 0; repo-wide grep shows no other writer), while prompts.py:172-173 orders the model to treat it as ground truth ('if the accepted count did not rise, the flag was not accepted'). The confirmed/partial branches only set confirmed_flag (:240-241, :530-534), so a run-time accept never moves the count. (Minor inaccuracy: a resubmission of an accepted flag dedups at swarm.py:200-201/214-220 as ALREADY SOLVED/ALREADY ACCEPTED, not 'INCORRECT - already tried this exact flag.'; the stale-count defect is nonetheless real.)"
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 459,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "Tokens consumed by an interrupted/failed run are never recorded; `_result`'s \"usage event on EVERY exit\" backstop emits nothing for a first-run failure",
+  "detail": "`self.cost_tracker.record(...)` (line 459) runs only after `await self._agent.run(...)` returns normally. A run that raises (CancelledError, provider/network error) has its tokens thrown away: they never reach `cost_tracker` and never reach the trace, so cost totals and budget decisions under-report (exactly the case the comments at 564-566 claim to cover). The `_result` delta block (562-578) can only re-emit deltas of usage that was already recorded into `cost_tracker.by_agent`; when the first run fails, `agent_usage` is None (563) and no usage event is emitted at all, so \"a usage event lands on EVERY exit\" is false.",
+  "fix_hint": "Create a caller-owned `RunUsage()` and pass `usage=u` to `Agent.run` (pydantic-ai 2.56 threads it into graph state and mutates it in place, so it survives cancellation), then perform the single `cost_tracker.record(...)` call in a `finally:` guarded against double-recording.",
+  "evidence": "Confirmed. headless_solver.py:459-465 calls `self.cost_tracker.record(...)` only after `await self._agent.run(...)` returns; a raise jumps to :491/:501 without recording. `_result` can only emit usage when `agent_usage = self.cost_tracker.by_agent.get(self.agent_name)` exists (:562-564), so on a first-run failure by_agent is empty and no usage event is written at all; tracer.usage is called only at :573 (grep shows record_tokens/model_response are unused). Tokens consumed by a cancelled/errored run are lost from both cost totals and the trace, contradicting the comment at :564-567 ('a usage event lands on EVERY exit')."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 475,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "Rescue auto-submissions feed the swarm-wide wrong-flag circuit breaker and can cancel every sibling solver",
+  "detail": "The rescue loop `for candidate in _extract_flag_candidates(output): await self._submit_final_output_candidate(candidate)` (475-478) submits every flag-shaped token in the model's closing prose through `submit_fn` -> `swarm.try_submit_flag`. Each incorrect one increments `self._wrong_total` (backend/agents/swarm.py:275) and at `SUBMIT_LOCK_WRONG_LIMIT = 4` (swarm.py:184) the whole swarm is killed via `cancel_event.cancel_with_reason(\"circuit_breaker\")` (swarm.py:276-280). A chatty model whose final summary lists several decoys can, by itself, cancel every sibling solver on the task in a single step — and the model never knows these submissions happened, so it cannot correct course.",
+  "fix_hint": "Limit rescue submissions (e.g. at most one candidate the model explicitly presented as the flag, or only when it differs from every rejected candidate), or exclude rescue-driven submissions from `_wrong_total` accounting.",
+  "evidence": "Confirmed. headless_solver.py:475-478 submits every `_extract_flag_candidates(output)` through `_submit_final_output_candidate`, which calls `self.deps.submit_fn(candidate)` (:522-523) -> swarm.try_submit_flag; each non-correct result does `self._wrong_total += 1` (swarm.py:275) and at SUBMIT_LOCK_WRONG_LIMIT=4 (:184) `self.cancel_event.cancel_with_reason('circuit_breaker')` (:280) stands the whole swarm down. Rescue submissions/results are only appended to _findings and the tracer, never shown to the model, so several decoys in one closing summary can trip the breaker unaided."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 501,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "Confirmed flag is discarded on the generic Exception path — the CancelledError handler has the guard, the Exception handler does not",
+  "detail": "The `except asyncio.CancelledError` handler (491-500) explicitly re-checks `self.deps.confirmed_flag and not self._confirmed` and returns FLAG_FOUND because \"the run can be cancelled between the platform's flag confirmation and this return\". The `except Exception as e:` handler (501-505) returns `self._result(ERROR)` with no such check. Any non-cancel exception raised after `submit_fn`/`do_submit_flag` confirmed the flag (e.g. a tracer write failure inside `_submit_final_output_candidate`, a submit-tool error surfacing during result processing, a network error in the same agent turn) makes the solver report ERROR, so the swarm and coordinator never record the solve even though the platform already accepted the flag.",
+  "fix_hint": "Mirror the CancelledError guard in the Exception handler, or centralize the check inside `_result`: if `deps.confirmed_flag` is set, FLAG_FOUND wins over ERROR.",
+  "evidence": "Confirmed. The CancelledError handler (headless_solver.py:491-500) has `if self.deps.confirmed_flag and not self._confirmed:` before returning FLAG_FOUND; the generic handler (501-505) `except Exception as e: ... return self._result(ERROR)` has no equivalent check, and _result() reports flag=self._flag (None). A provider/network error raised inside the same Agent.run after a confirmed submit therefore surfaces ERROR even though the platform accepted the flag. Recovery is possible if a later loop pass returns normally (line 479) but not guaranteed: 3 consecutive errors break (swarm.py:358-364) and a set cancel_event stops further runs. (The cited 'tracer write failure' example cannot actually raise - SolverTracer._write swallows all exceptions at tracing.py:35-40 - but the defect itself stands.)"
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 556,
+  "severity": "medium",
+  "category": "concurrency",
+  "summary": "Operator bump landing mid-run is silently discarded by the `_messages` reassignment in the run loop",
+  "detail": "`bump()` appends the ModelRequest to `self._messages` (line 556), but a run already in flight captured `message_history=self._messages` (line 453) and will overwrite the list wholesale at line 466 (`self._messages = result.all_messages()`), dropping the appended message — the appended MessageRequest never reaches the live agent run and never survives it. This is the exact path used by the web console's \"talk to the agent\": coordinator_loop.py:425 calls `solver.bump(...)` on a running solver, so operator guidance is lost with no error and no trace beyond the `bump` event.",
+  "fix_hint": "Queue bumps (`self._pending_bumps`) and consume them at the top of `run_until_done_or_gave_up` by appending to `_messages` before the run, or detect an in-flight run in `bump()` and defer/log accordingly.",
+  "evidence": "Confirmed. headless_solver.py:556 `self._messages.append(bump_msg)` appends to the list the in-flight run captured at :453 (`message_history=self._messages...`), and the loop then replaces it wholesale at :466 (`self._messages = result.all_messages()`). pydantic-ai 2.56 copies caller history (_agent_graph.py:934 `messages = _clean_message_history(list(message_history or []))`; comment at :857 'caller-owned message_history objects are never mutated in place'), so a mid-run append neither reaches the run nor survives it. The web console hits this exact path: coordinator_loop.py:425 `solver.bump(f'[Operator guidance] {message}')` on a live solver."
+ },
+ {
+  "file": "backend/agents/swarm.py",
+  "line": 98,
+  "severity": "medium",
+  "category": "concurrency",
+  "summary": "Dedup/cooldown/circuit-breaker state is per-swarm-instance and reset by every re-spawn, so the platform error budget is not protected across attempts",
+  "detail": "All submission bookkeeping (_confirmed_flags/_accepted_flags/_submit_count/_submitted_flags/_last_submit_time/_wrong_total/_submit_locked, swarm.py:96-102) lives on the ChallengeSwarm instance and is serialised only by its own asyncio.Lock — correct within one instance/event loop, but every re-spawn builds a fresh ChallengeSwarm (coordinator_core.py:112-119). The early-exit retry path (coordinator_core.py:121-134) re-queues any challenge whose swarm returned None — precisely what a circuit-breaker stand-down produces — and /resume plus the deadlock auto-resume also respawn (coordinator_loop.py:238-256, 385-392). The breaker resets to 0 wrong submissions and _submitted_flags is empty, so previously rejected flags can be guessed again and the per-task wrong-submission protection does not survive restarts.",
+  "fix_hint": "Keep per-challenge submission bookkeeping on CoordinatorDeps (keyed by challenge name) and seed each new swarm from it; or refuse auto-retry when the previous attempt ended via circuit_breaker (surface the reason instead of returning None).",
+  "evidence": "Confirmed. All submission bookkeeping is per-instance (swarm.py:96-102) and every respawn builds a fresh ChallengeSwarm (coordinator_core.py:111-121). The early-retry path (coordinator_core.py:130-147) re-queues a challenge whose swarm returned None - which is what a breaker stand-down produces, since swarm.run returns self.winner (:461-462), None whenever nothing reached FLAG_FOUND - and /resume (coordinator_loop.py:379-386) plus the deadlock auto-resume (:459-461) also respawn. Each fresh swarm starts with _wrong_total=0, _submit_locked=False and an empty _submitted_flags, so previously rejected flags can be guessed again and the breaker does not survive restarts."
+ },
+ {
+  "file": "backend/agents/swarm.py",
+  "line": 186,
+  "severity": "medium",
+  "category": "missing-test",
+  "summary": "No tests exist for the swarm lifecycle state machines (cooldown/breaker/partial credit/teardown)",
+  "detail": "The repo contains zero test files (no test_*.py or conftest.py outside .venv; docs/upgrade-rounds.md R4 is still pending), while swarm.py concentrates exactly the logic that fails silently: try_submit_flag dedup/cooldown/breaker (swarm.py:186-292), _run_solver_loop bump/consecutive-error counting (swarm.py:315-395), the partial-stall watchdog (swarm.py:397-426) and run()'s task lifecycle/cancellation cleanup (swarm.py:428-478). message_bus.py cursor/trim logic (message_bus.py:28-43) is untested as well.",
+  "fix_hint": "Add pytest coverage (R4): duplicate/partial/locked/cooldown/'unknown' submit outcomes against a stub platform; bump and consecutive-error limits with a stub solver; watchdog timing with a fake clock; message_bus cursor/trim behaviour.",
+  "evidence": "Confirmed. A repo-wide find (excluding .venv) returns no test_*.py, no conftest.py and no tests/ directory, and docs/upgrade-rounds.md:30 still lists 'R4 | 测试基座（全模块 pytest 套件） | 待办'. The cited untested units exist exactly as claimed: swarm.py:186-292 (try_submit_flag dedup/cooldown/breaker), :315-395 (_run_solver_loop), :397-426 (partial-stall watchdog), :428-478 (run lifecycle) and message_bus.py:28-43 (post/check cursor+trim)."
+ },
+ {
+  "file": "backend/agents/swarm.py",
+  "line": 242,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "`try_submit_flag` blacklists a flag before the platform call, and counts infrastructure non-judgments as wrong guesses toward the circuit breaker",
+  "detail": "`self._submitted_flags.add(normalized)` executes before `await self.platform.submit_flag(...)`; if that call raises, the handler at 247 returns \"submit_flag error: ...\" and the flag is permanently deduped — a later retry short-circuits at 224 with \"INCORRECT — already tried this exact flag.\" without ever reaching the platform, and the solver records it into `rejected_flags`. Separately, the block at 273-276 increments `_wrong_total` for every non-correct result, including \"UNKNOWN —\", \"INVALID_STATE —\", and \"SUBMIT ERROR\" displays from the TSec adapter (backend/tsec_platform.py), so transient platform problems consume the 4-strike breaker and escalating cooldowns meant for real wrong guesses.",
+  "fix_hint": "Add to `_submitted_flags` only after the platform returns a judged result; treat only explicit INCORRECT/DUPLICATE statuses as wrong guesses for cooldowns and the breaker.",
+  "evidence": "Confirmed. swarm.py:242 `self._submitted_flags.add(normalized)` runs before :245 `result = await self.platform.submit_flag(...)`; on raise, :246-247 returns 'submit_flag error' but the flag stays deduped, so a retry hits :223-224 'INCORRECT - already tried this exact flag.'. Also confirmed: :273-276 counts every status other than 'already_solved'/'correct' as wrong - including the adapter's 'unknown' from tsec_platform.py:188 (not found), :230 (invalid_state) and :234 (non-duplicate HTTPStatusError); transport errors propagate un-retried through _api_post, so both halves of the claim are real."
+ },
+ {
+  "file": "backend/agents/swarm.py",
+  "line": 242,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "Flag is added to the dedup set before submission, so a transient submit error permanently blacklists a flag that was never delivered",
+  "detail": "swarm.py:242 executes self._submitted_flags.add(normalized) before the await at :245. If platform.submit_flag raises, :246-247 returns 'submit_flag error' but the flag remains in _submitted_flags, so every later attempt hits :223-224 ('INCORRECT — already tried this exact flag.'). Because that display starts with 'INCORRECT', the solver's submit_flag tool also appends the flag to deps.rejected_flags (headless_solver.py:247-249), and _is_rejected_variant then suppresses even final-output rescue submissions (headless_solver.py:63-77, 509-525). One network hiccup can permanently remove a correct flag from play for the whole swarm.",
+  "fix_hint": "Record the flag only after a definitive outcome (or discard it in the except path), and give the error path a distinct message that the solver does not treat as a rejection.",
+  "evidence": "Confirmed - same mechanism as the other swarm.py:242 finding: the dedup add at :242 precedes the await at :245, the error path :246-247 leaves the flag deduped, later attempts return the 'INCORRECT - already tried this exact flag.' string (:223-224), headless_solver.py:245-246 appends it to deps.rejected_flags, and _is_rejected_variant (defined at headless_solver.py:73-84, used at :512-516) then suppresses final-output rescue. One transient submit error removes the flag from play for that swarm's lifetime (only a respawn resets the state). The cited sub-ranges (247-249, 63-77, 509-525) are a few lines off but the described behavior matches the code."
+ },
+ {
+  "file": "backend/cli.py",
+  "line": 158,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "The CLI unconditionally overwrites .env-sourced settings: MAX_CONCURRENT_CHALLENGES and PLATFORM_MODE are silently ignored.",
+  "detail": "`settings.max_concurrent_challenges = max_challenges` (backend/cli.py:158) runs even when --max-challenges was not passed, because the click option has `default=3` (backend/cli.py:105-110). An operator who set MAX_CONCURRENT_CHALLENGES=1 or 2 in .env (documented at .env.example:36, alias at backend/config.py:69-71) silently gets 3 containers. Immediately after, `settings.platform_mode = \"tsec\"` (backend/cli.py:159) makes PLATFORM_MODE — documented at .env.example:4 and defined with an alias at backend/config.py:11 — a dead knob; _create_platform (backend/agents/coordinator_loop.py:142-148) also only accepts 'tsec'-family values, so the documented setting can never do anything.",
+  "fix_hint": "Default the option to None and assign `settings.max_concurrent_challenges` only when explicitly provided; drop PLATFORM_MODE from .env.example/config or honor it.",
+  "evidence": "Claim matches the code. cli.py:105-110 gives `--max-challenges` `default=3`, and cli.py:158 `settings.max_concurrent_challenges = max_challenges` runs unconditionally, so .env `MAX_CONCURRENT_CHALLENGES` (alias config.py:69-71, documented .env.example:36) is silently overwritten with 3 unless the flag is explicitly passed. cli.py:159 `settings.platform_mode = \"tsec\"` likewise neutralizes `PLATFORM_MODE` (config.py:11, .env.example:4), and _create_platform (coordinator_loop.py:142-148) only accepts the 'tsec' family anyway."
+ },
+ {
+  "file": "backend/config.py",
+  "line": 40,
+  "severity": "medium",
+  "category": "api-compat",
+  "summary": "The shipped Qwen defaults pair a Responses-API mode with the DashScope chat-completions base URL, so the alternate path POSTs to <chat-url>/responses.",
+  "detail": "qwen_base_url defaults to 'https://dashscope.aliyuncs.com/compatible-mode/v1' (backend/config.py:36-39) while qwen_api_mode defaults to 'responses' (L40-43); resolve_model therefore builds OpenAIResponsesModel (backend/models.py:100-107), and the openai SDK appends '/responses' to base_url (openai/resources/responses/responses.py:1056). The repo's own URL sniffing only rewrites the mode when the URL ends with '/responses' or '/chat/completions' (backend/models.py:88-96) — the default URL ends with neither, so the unverified mode is used verbatim. pydantic-ai's dedicated AlibabaProvider (not used here) documents exactly this base URL as the Chat Completions endpoint (pydantic_ai/providers/alibaba.py docstring and its `openai_chat_supports_document_input=False` chat-only profile), and nothing in the repo (.env.example:17-18 repeats the same pairing) documents a DashScope responses URL.",
+  "fix_hint": "Default QWEN_API_MODE to 'chat' (matching the default URL), or default QWEN_BASE_URL to the real responses endpoint and document it; verify the chosen pairing with `ctf-solve --model-smoke-test`.",
+  "evidence": "Claim matches the code. config.py:37 default `\"https://dashscope.aliyuncs.com/compatible-mode/v1\"` and config.py:41 default `qwen_api_mode=\"responses\"`; models.py:92-97 rewrites the mode only when the URL ends with '/responses' or '/chat/completions' (the default ends with neither), so L100-106 builds OpenAIResponsesModel on the chat URL; the openai SDK posts to `\"/responses\"` appended to base_url (openai/resources/responses/responses.py:1056) => POST <chat-url>/responses. pydantic-ai's AlibabaProvider uses the same compatible-mode base as a chat endpoint (`self._base_url = base_url or 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'`, providers/alibaba.py:94; chat-only profile `openai_chat_supports_document_input=False`); .env.example:17-18 ships the same pairing with no documented DashScope responses URL."
+ },
+ {
+  "file": "backend/cost_tracker.py",
+  "line": 15,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "PROVIDER_MAP uses genai-prices provider ids that do not exist ('alibaba', 'zhipu'), so every qwen/glm cost silently falls back to a stale hard-coded table.",
+  "detail": "PROVIDER_MAP = {\"deepseek\": \"deepseek\", \"qwen\": \"alibaba\", \"glm\": \"zhipu\"} (backend/cost_tracker.py:15-19). The installed genai-prices snapshot has provider ids 'deepseek' (data.py:4218), 'zai' (data.py:20436) and 'zhipuai' (data.py:20516) — there is no 'alibaba' and no 'zhipu' anywhere in genai_prices/data.py. find_provider raises a lookup error for an unknown provider_id (genai_prices/data_snapshot.py:135-167); calc_cost swallows it with `except Exception: pass` (backend/cost_tracker.py:66-68) and returns FALLBACK_PRICING. The caller passes the bare provider token (`provider_spec=provider_from_spec(self.model_spec)`, backend/agents/headless_solver.py:463), so this fires on every GLM/Qwen run. Concrete drift: FALLBACK_PRICING['glm-5.3'] is 0.60/0.11/2.20 USD/M (backend/cost_tracker.py:38-42) while the installed snapshot prices glm-5.3 at 1.12/0.208/3.52 (data.py:19202-19207) — reported GLM cost is roughly halved, silently.",
+  "fix_hint": "Map 'glm' to the real id 'zai' (or 'zhipuai'), replace 'alibaba' (no such provider) with a provider_api_url lookup for DashScope or accept fallback explicitly, and log at warning level whenever the fallback table is used.",
+  "evidence": "Claim matches the code. cost_tracker.py:15-19 `PROVIDER_MAP = {\"deepseek\": \"deepseek\", \"qwen\": \"alibaba\", \"glm\": \"zhipu\"}`; the installed genai-prices 0.1.11 snapshot has no provider id 'alibaba' or 'zhipu' (only `id='zai'` data.py:20436 and `id='zhipuai'` data.py:20516), find_provider raises `raise _provider_lookup_error(...)` for an unknown provider_id (data_snapshot.py:135-166), and calc_price's failure is swallowed by `except Exception: pass` (cost_tracker.py:71-72) -> FALLBACK_PRICING. Drift is real: fallback glm-5.3 is 0.60/0.11/2.20 (cost_tracker.py:38-42) while the snapshot prices glm-5.3 at 1.12/0.208/3.52 (data.py:19207) and, under zhipuai, 1.103/0.276/3.862. Caller passes the bare token (`provider_spec=provider_from_spec(self.model_spec)`, headless_solver.py:463)."
+ },
+ {
+  "file": "backend/cost_tracker.py",
+  "line": 46,
+  "severity": "medium",
+  "category": "missing-test",
+  "summary": "The cost-math module has no tests, and the provider-id defect above would have been caught by the cheapest possible test.",
+  "detail": "The repo has no tests/ directory, no conftest.py and no pytest config despite pytest>=9.0 / pytest-asyncio>=1.3 being dev deps (pyproject.toml:28-34). `_calc_fallback_cost` (backend/cost_tracker.py:46-58) is the money math — the uncached/cached split relies on pydantic-ai's inclusive input_tokens semantics — and `calc_cost` (L61-79) plus `total_tokens` (L161-165) are pure given a RunUsage. A test asserting that calc_price succeeds for each PROVIDER_MAP value against the installed genai-prices (or pinning the fallback table to it) would have failed on 'alibaba'/'zhipu' immediately.",
+  "fix_hint": "Add tests/test_cost_tracker.py: fixed RunUsage for fallback arithmetic, a routing test per provider id, and a change-detector test comparing FALLBACK_PRICING against genai-prices' snapshot values.",
+  "evidence": "Claim matches the repo state. No tests/ directory, no conftest.py, no pytest config and no test files exist (`find . -name 'test*'` excluding .venv and `git ls-files | grep -i test` are empty) although pyproject.toml:30-31 declares pytest>=9.0 / pytest-asyncio>=1.3. `_calc_fallback_cost` (cost_tracker.py:46-58) and `calc_cost` (L61-79) are untested; a routing test over PROVIDER_MAP (L15-19) would immediately fail on 'alibaba'/'zhipu' (finding 7's defect), confirming the gap is real and cheap to close."
+ },
+ {
+  "file": "backend/deps.py",
+  "line": 43,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "HeadlessDeps.flags_accepted is never updated, so task_status() reports stale progress the prompt calls ground truth",
+  "detail": "flags_accepted (deps.py:43) is initialised once from meta.correct_flag_count (headless_solver.py:359) and grep shows no writes anywhere in the repo; its only reader is task_status() (headless_solver.py:286). The solver prompt explicitly instructs: 'Treat task_status as ground truth after each submit_flag: if the accepted count did not rise, the flag was not accepted' (prompts.py:172-173). After a partial-credit accept on a multi-flag task the count therefore never rises, and the model is told its accepted flag failed. The swarm tracks _accepted_flags (swarm.py:97) but the (display, is_confirmed) submit contract (deps.py:19) carries no accepted count.",
+  "fix_hint": "Increment deps.flags_accepted on every accepted submit — extend the submit callback contract with the accepted count / SubmitResult.progress, or parse challenge_complete+progress — so task_status reflects banked partial credit.",
+  "evidence": "Confirmed. deps.py:43 `flags_accepted: int = 0`; its only reader is headless_solver.py:286 and its only writer is :359 `flags_accepted=meta.correct_flag_count` (repo-wide grep). prompts.py:172-173 calls the accepted count ground truth, yet the submit contract is only tuple[str, bool] (deps.py:19) while the swarm separately tracks _accepted_flags (swarm.py:97), so partial credit never reaches the solver's counter and task_status under-reports after every run-time accept."
+ },
+ {
+  "file": "backend/models.py",
+  "line": 153,
+  "severity": "medium",
+  "category": "api-compat",
+  "summary": "resolve_model_settings' max_tokens never reaches the wire as `max_tokens`: pydantic-ai emits it as `max_completion_tokens` for all three providers, and the deepseek cap equals the entire 128k context window.",
+  "detail": "resolve_model_settings returns OpenAIChatModelSettings(max_tokens=128_000) for deepseek (backend/models.py:150-153) and max_tokens=32_768 for glm/qwen (L154-157). OpenAIChatModel maps the setting via `supports_max_completion_tokens = profile.get('openai_chat_supports_max_completion_tokens', True)` and then sends `max_completion_tokens=...` (installed pydantic_ai/models/openai.py:1448-1453); only the azure and openrouter providers override that flag to False, the OpenAIProvider used at backend/models.py:76/102/111/140 does not. DeepSeek, DashScope and BigModel all document the field as `max_tokens`, so the intended output cap is at best silently ignored. Separately, 128_000 contradicts the code's own comment ('Cap output tokens to avoid reserving the full context', L151-152) because deepseek-chat's context window is 128_000 (CONTEXT_WINDOWS, L49-54) — the setting reserves the whole window as output.",
+  "fix_hint": "Pin the request field, e.g. OpenAIChatModel(model_id, provider=..., profile=OpenAIModelProfile(openai_chat_supports_max_completion_tokens=False)) — or use the dedicated DeepSeek/Alibaba/Zai providers if they gain that profile flag — and reduce the deepseek cap to the model's real output ceiling; verify with --model-smoke-test plus a request log.",
+  "evidence": "Both parts hold. models.py:151-153: comment `Cap output tokens to avoid reserving the full context.` then `return OpenAIChatModelSettings(max_tokens=128_000)` for deepseek - equal to `CONTEXT_WINDOWS['deepseek-chat'] = 128_000` (L50), i.e. the whole window. Installed pydantic-ai maps the setting away from `max_tokens`: `supports_max_completion_tokens = profile.get('openai_chat_supports_max_completion_tokens', True)` -> `max_completion_tokens=max_tokens if supports_max_completion_tokens else OMIT` (pydantic_ai/models/openai.py:1450, 1460-1461); only azure (azure.py:154) and openrouter (openrouter.py:199) flip the flag, and backend/models.py uses a plain OpenAIProvider (L76/102/111/140). Nuance: for qwen's default responses mode it maps to max_output_tokens (openai.py:3254), so 'for all three providers' is slightly overbroad, but the deepseek/glm substance stands."
+ },
+ {
+  "file": "backend/tools/local_exec.py",
+  "line": 36,
+  "severity": "medium",
+  "category": "safety",
+  "summary": "Child processes escape the guard entirely: only in-process Python sockets are restricted, while subprocess/os.system/ctypes reach any host.",
+  "detail": "The docstring states 'outbound socket connections from the snippet are restricted to these hosts (target lock) plus localhost', but `subprocess.run(['curl', 'http://10.0.3.9/'])`, `os.system`, `os.popen`, `ctypes` or any bundled binary run outside the interpreter where the monkeypatch has no effect. The tool contract shown to the model (prompts.py:137-138) and the degraded-lock message ('ALL outbound network access is locked', headless_solver.py:401-409) overstate enforcement; a snippet can trivially reproduce the c-03 drift the lock exists to prevent.",
+  "fix_hint": "State the in-process-only limitation honestly in the tool description/prompt, and/or add OS-level egress control for locked runs (per-child firewall rule, job object, network namespace); pure in-process patching cannot cover this.",
+  "evidence": "Claim matches the code. The guard rebinds only socket functions inside the snippet's own interpreter (local_exec.py:59-68); nothing intercepts child processes. Docstring at local_exec.py:35-36 claims `outbound socket connections from the snippet are restricted to these hosts (target lock) plus localhost`, and prompts.py:137-138 tells the model `run_python socket connections to any other host are blocked` - but `subprocess.run(['curl', ...])`, os.system/os.popen/ctypes or any child interpreter never execute the preamble, so egress fully escapes the stated guarantee."
+ },
+ {
+  "file": "backend/tools/local_exec.py",
+  "line": 51,
+  "severity": "medium",
+  "category": "safety",
+  "summary": "asyncio.open_connection bypasses the guard on Windows' default Proactor loop (ConnectEx on the raw fd).",
+  "detail": "The preamble wraps only `socket.socket.connect` and `socket.create_connection`. On Unix the selector loop calls `sock.connect` (Lib/asyncio/selector_events.py:651) and is caught, but on Windows `loop.create_connection` -> `ProactorEventLoop.sock_connect` (Lib/asyncio/proactor_events.py:724) -> `IocpProactor.connect`, which issues `ov.ConnectEx(conn.fileno(), address)` (Lib/asyncio/windows_events.py:597) directly on the fd and never calls the Python method — and this project runs on win32. `asyncio.run(asyncio.open_connection('10.0.3.9', 80))` inside a snippet therefore reaches any host while the guard believes egress is restricted.",
+  "fix_hint": "Language-level socket patches cannot intercept ConnectEx: wrap/deny `asyncio.open_connection` and `loop.create_connection` (e.g. replace them with guard-checking versions when sys.platform == 'win32'), or document the platform gap and enforce egress at the OS level (firewall/job object) for locked runs.",
+  "evidence": "Code matches the claim. local_exec.py:59-68 patches only `_socket.socket.connect = _connect` and `_socket.create_connection`; CPython 3.14 win32 (verified in the local stdlib) makes Proactor the default (`_DefaultEventLoopPolicy = _WindowsProactorEventLoopPolicy`, Lib/asyncio/windows_events.py) and its connect path runs `return await self._proactor.connect(sock, address)` (proactor_events.py:723-724) -> `ov.ConnectEx(conn.fileno(), address)` (windows_events.py:597) directly on the fd, never calling the patched Python method. The Unix selector path does call `sock.connect(address)` (selector_events.py:651) and is caught. So `asyncio.run(asyncio.open_connection('10.0.3.9', 80))` inside a snippet bypasses the target lock on this project's platform."
+ },
+ {
+  "file": "backend/tools/local_exec.py",
+  "line": 63,
+  "severity": "medium",
+  "category": "safety",
+  "summary": "Guard patches only socket.socket.connect; connect_ex, the _socket.socket base class, and the exposed _orig_connect name all bypass the target lock.",
+  "detail": "`_socket.socket.connect = _connect` patches the Python subclass (CPython 3.14 Lib/socket.py:218 defines `class socket(_socket.socket)`), leaving three bypasses: (a) `s.connect_ex((host, port))` — a distinct C method on the same class, never wrapped, enough for a one-call TCP bypass (ssl.SSLSocket.connect_ex routes to `super().connect_ex(addr)`, Lib/ssl.py:1389, so TLS too; only `super().connect`, Lib/ssl.py:1392, is caught); (b) `import _socket; _socket.socket(...)` gives the C base class whose connect is untouched; (c) the originals are left as snippet-module globals (`_orig_connect` line 59, `_orig_ce` line 64), so user code can call `_orig_connect(sock, addr)` directly or restore `socket.socket.connect = _orig_connect`. The docstring promises outbound connections 'are restricted to these hosts (target lock) plus localhost' (lines 35-37).",
+  "fix_hint": "Wrap connect_ex and sendto/sendmsg on both the Python subclass and the C base class, hide the originals via default-arg binding (`def _connect(self, address, _orig=_orig_connect)`) and del the names, and add a snippet-level test that exercises connect/connect_ex/_socket.socket directly.",
+  "evidence": "backend/tools/local_exec.py preamble lines 51-70: only `_orig_connect = _socket.socket.connect` (59) is replaced (`_socket.socket.connect = _connect`, 63) plus `_orig_ce = _socket.create_connection` (64) / patch (68) / `del _socket` (69). CPython 3.14 Lib/socket.py:218 defines `class socket(_socket.socket)` overriding neither connect nor connect_ex, so `sock.connect_ex((host, port))` reaches the unpatched C method (Lib/_socket) — and ssl.py:1389 SSLSocket.connect_ex calls `super().connect_ex(...)` (only the connect path at 1392 was the concern), so `socket.connect_ex` and SSL connect_ex bypass the guard; `import _socket; _socket.socket(...)` bypasses it too since the patch is applied on the subclass attribute. The guard also does not cover `socket.socketpair`/`sendto` on UDP paths. `_orig_connect`/`_orig_ce` are left as snippet globals (only `_socket` is deleted at 69), so the code can re-invoke the unpatched originals, contradicting the stated sandbox promise in the module docstring (35-37)."
+ },
+ {
+  "file": "backend/tools/net_tools.py",
+  "line": 118,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "tcp_send's read phase has no overall deadline: a slow-drip service stalls the tool call for the rest of the task budget.",
+  "detail": "`read_timeout` only bounds `asyncio.open_connection` (net_tools.py:105-107); the read loop `while total < MAX_TCP_OUTPUT:` awaits `reader.read(8192)` with `timeout=keep_open_seconds` (118-126) and exits only on 3s of silence, EOF, or 24KB. A service emitting a byte every <3s keeps the loop alive (up to 24,000 reads, i.e. hours at 1 byte/2.9s), and nothing clamps the exchange to the solver's remaining budget — cancellation only arrives when the challenge time limit cancels the run (no wait_for wraps solver.run_until_done_or_gave_up, swarm.py:329). One tool call can therefore consume the whole remaining task time.",
+  "fix_hint": "Wrap the entire send/read exchange in `asyncio.wait_for(..., timeout=read_timeout)` (or a dedicated max_exchange_seconds) so the stated read timeout is also a hard ceiling, keeping the 3s silence window as the soft end condition.",
+  "evidence": "Claim matches the code. net_tools.py:105-107 wraps only `asyncio.wait_for(asyncio.open_connection(host, port), timeout=read_timeout)`; the read loop L119-120 (`while total < MAX_TCP_OUTPUT:` / `chunk = await asyncio.wait_for(reader.read(8192), timeout=keep_open_seconds)`) exits only on 3s silence, EOF, or 24KB, so a >1-byte-per-3s drip keeps it alive up to 24,000 reads (hours). Nothing wraps the exchange: swarm.py:329 `result = await solver.run_until_done_or_gave_up()` is unbounded; the only clamp is the challenge wall-clock `asyncio.wait({run_task}, timeout=limit)` (coordinator_core.py:170)."
+ },
+ {
+  "file": "backend/tsec_platform.py",
+  "line": 31,
+  "severity": "medium",
+  "category": "missing-test",
+  "summary": "tsec_platform.py — the most logic-dense adapter in the repo — has no test coverage at all.",
+  "detail": "No test files exist anywhere in the tree (only .venv matches) although pytest>=9.0 and pytest-asyncio are declared dev dependencies (pyproject.toml:30-31). Untested logic includes: base_url joining and non-JSON handling (49-97), 409 max-active backoff (331-354), close retry/4xx semantics (371-401), duplicate and invalid_state mapping incl. multi-flag challenge_complete (194-259), pull polling and `_started_addrs` bookkeeping (410-465), ghost reaping (277-305). Every one of these behaviors is currently validated only against the live platform.",
+  "fix_hint": "Add tests/test_tsec_platform.py using httpx.MockTransport (fully offline) covering the branches listed; wire it into the planned pytest gate.",
+  "evidence": "backend/tsec_platform.py has no covering tests (verified: no tests/ dir, no test_*.py/conftest.py outside .venv; pyproject.toml:29-31 only declares pytest/pytest-asyncio). The named untested branches all exist at the cited locations: base_url joining/non-JSON handling 49-97, 409 max-active backoff 331-354, close retry/4xx semantics 371-401, duplicate and invalid_state mapping incl. multi-flag challenge_complete 194-259, pull polling and _started_addrs bookkeeping 410-465, ghost reaping 277-305. Findings 7/8/9/10 are concrete defects that landed exactly in these untested paths."
+ },
+ {
+  "file": "backend/tsec_platform.py",
+  "line": 57,
+  "severity": "medium",
+  "category": "safety",
+  "summary": "TLS certificate verification is disabled on the client that carries the BENCHMARK_TOKEN.",
+  "detail": "`_ensure_client` passes `verify=False` (line 57) while sending the scoring token in the `BENCHMARK_TOKEN` header (lines 62-65), so any host on the network path can transparently intercept or alter start/submit/close traffic and credentials without a certificate error (httpx only emits an InsecureRequestWarning). The adjacent comment justifies `trust_env=False` alone; nothing explains or gates certificate verification, and this client is the transport for an official scoring run.",
+  "fix_hint": "Default to verify=True; if the endpoint needs a private/self-signed CA, make it an explicit opt-in setting with a bundled CA and log a warning when disabled.",
+  "evidence": "backend/tsec_platform.py:55-65: `async with httpx.AsyncClient(..., verify=False) as client:` with `headers = {... \"BENCHMARK_TOKEN\": self.token}` — TLS certificate verification is disabled with no opt-in setting, allowlist, or warning while the benchmark API token is sent on every request; the only other verify=False is net_tools.py:59. MITM/tamper risk on the office network the user explicitly described. (No network was used in this verification.)"
+ },
+ {
+  "file": "backend/tsec_platform.py",
+  "line": 213,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "Multi-flag duplicate submissions can never report challenge_complete, even when every flag is already banked.",
+  "detail": "The duplicate branch (lines 208-227) decides purely from the local `flag_count`: every multi-flag duplicate returns challenge_complete=False with \"Other flags are still open\" (213-221), never consults the platform completion evidence already present in the cached stub (`is_completed`/`correct_flag_count`, normalized at 142-152), and never updates `_solved_cache` (contrast the success path at 245). If a fully-solved multi-flag challenge receives a duplicate — reachable when an operator /resume re-spawns a deferred challenge that was solved meanwhile (coordinator_loop.py:381-385 routes through `_auto_spawn_one`, which never checks known_solved) — the swarm is told \"partial credit\" on every submission and can burn its full wall-clock budget, because the poller has no solved transition left to kill it; swarm.py:260 trusts challenge_complete for its confirm logic.",
+  "fix_hint": "On duplicate, refresh/consult the platform record (is_completed, or correct_flag_count >= flag_count, or counts in the error body) and set challenge_complete plus `_solved_cache.add(...)` when complete.",
+  "evidence": "backend/tsec_platform.py:208-227 duplicate branch: for multi-flag challenges it always returns `SubmitResult(..., challenge_complete=False)` (lines 213-221) — the cached platform evidence `ch.get('is_completed')` / `ch.get('correct_flag_count')` (lines 137-138, 148-149) is never consulted, and `self._solved_cache.add(name)` runs only in the correct path (line 245). swarm.py:260 `if result.challenge_complete or not multi_flag:` therefore treats an already-complete challenge as still in progress, sending solvers back to hunt for flags that no longer exist until budget exhaustion. Trigger: operator /resume of a challenge solved out-of-band; the duplicate answer's 'already solved' status is returned with challenge_complete=False."
+ },
+ {
+  "file": "backend/tsec_platform.py",
+  "line": 228,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "Platform-state submit errors (invalid_state, unknown challenge, generic API errors) map to status \"unknown\", which the swarm counts as a wrong guess.",
+  "detail": "`invalid_state` (lines 228-233) and every other non-duplicate error (line 234) — plus the challenge-not-found path at 187-191 — return status \"unknown\", indistinguishable from a genuinely wrong flag. swarm.py increments `_submit_count`/`_wrong_total` for any status that is neither \"correct\" nor \"already_solved\" (swarm.py:273-275), driving escalating cooldowns (swarm.py:227-238) and the four-strike circuit breaker (swarm.py:276-291). Consequence: submissions rejected while the platform is mid-close/mid-start, or a transient failure of the challenge-list refetch, can trip \"SUBMIT LOCKED ... incorrect submissions\" without a single wrong guess and stand the swarm down early.",
+  "fix_hint": "Introduce a distinct status (e.g. \"error\"/\"invalid_state\") for platform-state failures and exclude it from the swarm's wrong-count/cooldown accounting.",
+  "evidence": "backend/tsec_platform.py:228-234 maps invalid_state and other 4xx errors to `SubmitResult(status='unknown', ...)` (also the not-found branch at 187-191). In swarm.py:249-292 try_submit_flag, everything that is not 'correct'/'already_solved' falls through to lines 273-275 `self._submit_count[...] += 1; self._wrong_total += 1`, so infrastructure errors count as wrong submissions — triggering the per-model cooldown (lines 227-238) and, after four (4-strike breaker lines 276-291), the task-wide lock that prompts.py:171 warns about. 'unknown' also fails to distinguish a resubmit-duplicate from a genuinely wrong flag."
+ },
+ {
+  "file": "backend/tsec_platform.py",
+  "line": 357,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "A /start that yields no address is never recorded, so an aborted spawn re-POSTs /start on retry and creates a duplicate range instance.",
+  "detail": "`_started_addrs` gets an entry only when the start response already carries addrs (lines 355-357); the common \"container still provisioning\" case records nothing. If the 10-poll wait (435-454) times out or every poll request fails, pull_challenge raises (458-465) and the scheduler retries later; since no entry exists, the retry falls into the start branch and POSTs /start again (424-431) while the first instance may still be coming up — exactly the duplicate-instance hazard the code warns about at 424-427 and the README states as a contract (\"同一题在进程内只 start 一次\", README.md:42). Each duplicate consumes one of the scarce \"max active\" slots.",
+  "fix_hint": "Record that a start was issued (sentinel or empty-addr marker) before polling, and make the retry path poll the challenge listing instead of re-POSTing /start.",
+  "evidence": "backend/tsec_platform.py:355-357: `addrs = ... ; if addrs: self._started_addrs[unique_code] = addrs` — the in-process dedup cache is recorded only when the /start response carries addresses. If provisioning exceeds the pull budget, pull_challenge raises (lines 458-465 `raise`) and the retry path re-POSTs /start without the cache entry (lines 422-434), violating the README.md:42 contract '同一题在进程内只 start 一次（地址缓存复用）' and creating a second platform container instance for the same challenge."
+ },
+ {
+  "file": "backend/tsec_platform.py",
+  "line": 380,
+  "severity": "medium",
+  "category": "correctness",
+  "summary": "A close rejected with 4xx (e.g. invalid_state \"already closed\") is reported as failure, permanently leaking a local concurrency slot.",
+  "detail": "close_challenge re-raises every sub-500 response as terminal (lines 378-381) even though the code's own comment names \"invalid_state: already closed\" as the expected benign outcome. The caller cannot distinguish \"already closed\" from \"close failed\": `_started_addrs` is popped only on success (line 397) and release_challenge returns False (lines 316-322), which coordinator_core.py:211-217 reads as \"the container still occupies a platform slot\" and keeps counting forever (discard happens only when released is not False). Reachable whenever a close succeeded server-side but the client saw a 5xx/timeout and retried into a 4xx — the exact sequence the retry loop at 371-394 produces — and each occurrence shrinks the local concurrency window; repeated occurrences wedge the scheduler at \"At capacity\" while platform slots are actually free.",
+  "fix_hint": "Parse the 4xx body: treat invalid_state/'already closed' as success (pop `_started_addrs`, let release_challenge return True), or return a tri-state so the coordinator can reconcile.",
+  "evidence": "backend/tsec_platform.py:378-381: `except httpx.HTTPStatusError as e: # 4xx (e.g. invalid_state: already closed) is a terminal answer. / if e.response.status_code < 500: raise` — the comment says the request is already terminal, but the code aborts the retry loop by raising, and `_started_addrs.pop(unique_code, None)` is only reached after the loop (line 397). A transient 4xx therefore leaks the address-cache entry forever (README.md:42 '容器防重' contract broken), and release_challenge (307-322) swallows exceptions into `return False`, which routes the challenge into coordinator_core.py:211-217's permanent slot leak ('keeping it counted')."
+ },
+ {
+  "file": "pyproject.toml",
+  "line": 6,
+  "severity": "medium",
+  "category": "maintainability",
+  "summary": "Runtime dependencies are unpinned and uv.lock is gitignored, so upstream builds are not reproducible for a version-sensitive dependency set.",
+  "detail": "All runtime deps are bare names: pydantic-ai[openai], pydantic-settings, genai-prices, httpx, pyyaml, rich, click, fastapi, uvicorn[standard] (pyproject.toml:6-16); .gitignore:26 excludes `uv.lock` even though the worktree contains one (329 KB, present on disk), so fresh clones/CI resolve whatever is current. This audit found behavior that hinges on exact versions: genai-prices provider ids differ per snapshot ('zai'/'zhipuai' in the installed 0.1.11) and pydantic-ai's profile defaults drive the max_tokens/max_completion_tokens mapping (models/openai.py:1450).",
+  "fix_hint": "Either commit uv.lock (remove .gitignore:26) or add floors/ceilings for the API-sensitive packages, e.g. pydantic-ai>=2.56,<3, genai-prices>=0.1.11,<0.2, openai>=3.30,<4.",
+  "evidence": "Claim matches the repo state. pyproject.toml:6-16 lists bare names (`\"pydantic-ai[openai]\", \"pydantic-settings\", \"genai-prices\", ...`) and .gitignore:26 is `uv.lock` (git check-ignore -v reports `.gitignore:26:uv.lock`, and the file is untracked) although a 329 KB uv.lock exists on disk. Repro risk is concrete: behavior here depends on exact snapshots (genai-prices provider ids; pydantic-ai `profile.get('openai_chat_supports_max_completion_tokens', True)`, pydantic_ai/models/openai.py:1450)."
+ },
+ {
+  "file": "scripts/analyze_traces.py",
+  "line": 242,
+  "severity": "medium",
+  "category": "maintainability",
+  "summary": "The trace analyzer parses events the solver no longer emits and ignores the current telemetry, leaving one failure class unreachable and the new steering signals invisible.",
+  "detail": "It still parses `no_progress_warning` and `loop_break` (scripts/analyze_traces.py:242-245) and documents them in the schema comment (L16, L20-21), but the rewritten solver never emits them (docs/rewrite-plan.md removes no-progress steering; current events are emitted at backend/agents/headless_solver.py:162/185/395/436/534/558/587 and backend/agents/tracing_toolset.py:45/55/65). Consequently failure rule 4 `gave_up_stalled` (L320-321) can never fire, yet the report prints its description (L491-492) and a per-class count that is permanently 0. Conversely, `loop_detected` (tracing_toolset.py:45), `target_lock_degraded` (headless_solver.py:395) and `findings_injected` (tracing_toolset.py:65) are not parsed at all, and counters that are incremented — bumps, flag_confirm_events, target_lock_blocks, loop_breaks (L123, L134-137, L224, L241-247) — are never printed, so the report silently lacks the run's actual steering telemetry.",
+  "fix_hint": "Delete the stale branches/rules/docstring lines, parse and report loop_detected/target_lock_degraded/findings_injected (and print the already-collected counters), or drop counters that are never reported.",
+  "evidence": "Claim matches the code. analyze_traces.py:242-245 still parses `no_progress_warning` / `loop_break` (documented L20-21), but no backend file emits them (grep over backend/ finds no such tracer events), so rule 4 at L320-321 (`elif r.final_status == \"gave_up\" and r.no_progress_warnings:`) can never fire while its description is still printed (L491-492). Conversely `loop_detected` (tracing_toolset.py:45), `target_lock_degraded` (headless_solver.py:395-400) and `findings_injected` (tracing_toolset.py:65) are emitted but never parsed, and the counters bumps/flag_confirm_events/target_lock_blocks/loop_breaks (L123-137, 224, 241-247) are never emitted into the report."
+ },
+ {
+  "file": "backend/agents/coordinator_loop.py",
+  "line": 75,
+  "severity": "low",
+  "category": "concurrency",
+  "summary": "The interactive REPL's `input()` runs in the default executor and cannot be cancelled, so the process can hang at exit after /quit or Ctrl+C.",
+  "detail": "`line = await loop.run_in_executor(None, input, \"> \")` — cancelling `repl_task` in the shutdown finally (lines 308-314) cancels the awaiting future but leaves the worker thread blocked inside `input()`. `asyncio.run()` finishes with `loop.shutdown_default_executor()`, which joins default-executor worker threads (and `concurrent.futures`' atexit hook joins them too), so in `-i` mode the interpreter can block at exit until the operator presses Enter; on Windows (the target platform) a detached or closed console makes this look like a hard hang after the scheduler has already logged 'Scheduler shutting down...'.",
+  "fix_hint": "Read stdin on a dedicated daemon thread that pushes lines into `operator_inbox` (the thread dies with the process), or accept lines only when `sys.stdin.isatty()` and fall back to non-interactive; do not depend on cancelling a future parked in `input()`."
+ },
+ {
+  "file": "backend/agents/coordinator_loop.py",
+  "line": 121,
+  "severity": "low",
+  "category": "dead-code",
+  "summary": "The `max(1, ...)` clamp on `challenge_time_limit_seconds` is stored on a `CoordinatorDeps` field that nothing reads; the time-limit consumer reads raw settings, so `--time-limit 0` kills every swarm instantly.",
+  "detail": "`build_deps` writes `challenge_time_limit_seconds=max(1, getattr(settings, 'challenge_time_limit_seconds', 1800))` into deps, but no code reads `deps.challenge_time_limit_seconds` (verified by grep); `_time_limit_for_challenge` reads `int(getattr(settings, 'challenge_time_limit_seconds', 1800))` directly (swarm.py:60), and `--time-limit` is declared `type=int` with no lower bound (cli.py:91). `--time-limit 0` or a negative value therefore produces `limit = 0` when no total budget is set: `asyncio.wait({run_task}, timeout=0)` returns before the swarm runs, `swarm.kill('wall_clock')` fires, and every challenge is deferred with 'time limit reached (0s)', while `_create_solver` still hands solvers `max(300, 0 - 60) = 300` seconds. In the budget-tracked path the clamp expression `max(60, min(limit, int(remaining_global_seconds)))` can likewise exceed the remaining global budget whenever `min_remaining_seconds_to_spawn` is configured below 60.",
+  "fix_hint": "Pass the clamped deps value into `_time_limit_for_challenge` (or clamp at the use site with `max(60, ...)`), add `click.IntRange(min=60)` to `--time-limit`, and either delete the dead deps field or make it the single source of truth."
+ },
+ {
+  "file": "backend/agents/coordinator_loop.py",
+  "line": 132,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "One malformed or truncated `metadata.yml` aborts `build_deps`, so a previously crashed run can brick every subsequent startup.",
+  "detail": "The scan loop calls `ChallengeMeta.from_yaml(meta_path)` with no error handling (lines 129-135). `from_yaml` performs `yaml.safe_load` plus conversions such as `int(data.get('flag_count', 1) or 1)` (prompts.py:47-56), which raise on truncated YAML or non-numeric fields; `pull_challenge` writes that file with a plain `write_text` (tsec_platform.py:481-484), so a run killed mid-write leaves a partial file that makes the next `ctf-solve` invocation crash before the event loop starts, with no way to skip the bad directory.",
+  "fix_hint": "Wrap the per-directory parse in try/except, log a warning and skip (or re-pull) the offending directory, and write metadata.yml via a temp file plus os.replace to make it crash-safe."
+ },
+ {
+  "file": "backend/agents/coordinator_loop.py",
+  "line": 421,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "`__bump__` target lookups sit outside the guarded parse, so an unhashable JSON value raises TypeError and aborts the entire run as 'Scheduler fatal'.",
+  "detail": "The try/except (lines 410-417) covers only `json.loads` and the two subscripts; `swarm = deps.swarms.get(challenge)` (line 420) and `solver = swarm.solvers.get(model)` (line 421) run unguarded. A payload such as `{\"challenge\": [\"x\"], \"model\": \"y\", \"message\": \"hi\"}` parses cleanly and then raises `TypeError: unhashable type: 'list'`; it escapes the operator drain loop into `except Exception as e: logger.error(\"Scheduler fatal: %s\", e, exc_info=True)` (lines 305-306), so one malformed console/websocket message (web.py serializes whatever the UI sends, lines 237-243) terminates the benchmark run, which is then reported to the CLI as a normal return with no error status. Relatedly, `solver.bump(...)` is applied even when the solver's run has already finished (entries in `swarm.solvers` are never removed), so the guidance is dropped while `logger.info('Operator bumped ...')` (line 426) claims delivery.",
+  "fix_hint": "Validate/coerce before the lookups (`challenge = str(data['challenge'])`, `model = str(data['model'])`) or move the lookups inside the try and add TypeError/AttributeError to it; check swarm/solver liveness before reporting the bump as delivered."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 73,
+  "severity": "low",
+  "category": "missing-test",
+  "summary": "Flag extraction/normalization/rescue and target-lock helpers have zero tests",
+  "detail": "`_extract_flag_candidates` (51-58), `_norm_flag_text` (61-63), `_flag_inner` (66-70), `_is_rejected_variant` (73-84), `_parse_allowed_hosts` (87-98) and `_target_lock_block` (101-134) are pure, safety-critical functions — they decide what gets submitted and what gets blocked — yet the repo contains no tests at all (no `tests/` directory and no `test_*.py` outside .venv). The bugs above (IPv6 parsing, case-folded suppression, rescue breadth) are exactly what table-driven unit tests would catch.",
+  "fix_hint": "Add pytest coverage: IPv6/bracketed/ported hosts, rejected-variant edge cases (case, prefix swaps, whitespace), rescue extraction from mixed prose, and lock allow/deny for http_request/tcp_send."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 79,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "Case-folding reject-variant suppression can drop a distinct, possibly correct flag",
+  "detail": "`_norm_flag_text` lowercases and strips whitespace (61-63) and `_is_rejected_variant` compares normalized text (line 79) as well as inner content across different prefixes (82-83). Flags are compared exactly by the platform (tsec_platform sends `flag.strip()` verbatim and defines no `normalize_flag`), so a candidate `flag{AbC}` is treated as \"already rejected\" after `flag{abc}` failed, even though the platform never judged the exact string — the rescue path silently skips it. The inner-content rule likewise conflates `CTF{x}` and `flag{x}`.",
+  "fix_hint": "Compare exact strings for the already-rejected check (keep the inner-content heuristic only for same-case re-wrapped decoys), or centralize normalization in a platform-level `normalize_flag` hook that reflects the platform's actual case rules."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 94,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "Allowed-host parsing mangles IPv6 targets, silently locking the whole task",
+  "detail": "`part = re.sub(r\"^https?://\", \"\", part).strip(\"[]\").split(\"/\")[0]` followed by `host = part.rsplit(\":\", 1)[0] if \":\" in part else part` (94-95) assumes the last colon is a port separator: for `[2001:db8::1]:8080` the extracted \"host\" is `2001:db8::1]` (only the leading bracket is stripped and the trailing bracket survives), and for a bare `2001:db8::1` it is `2001:db8:`. Every request/tcp_send to the real target then fails the exact-match check at 126 (\"is not one of your assigned targets\") while `allowed_hosts` is non-empty, so the degraded-mode warning never fires — the solver is silently locked out of its own target.",
+  "fix_hint": "Parse with `urllib.parse.urlsplit` / a helper that strips brackets before splitting on \":\", or detect IPv6 literals with `ipaddress` and compare normalized addresses."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 94,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "_parse_allowed_hosts mis-parses bracketed/IPv6 targets, so the real target never enters the allow set and all its requests are blocked.",
+  "detail": "`.strip(\"[]\")` runs before the port split and `rsplit(\":\", 1)` assumes IPv4: `[2001:db8::1]:8443` -> `2001:db8::1]`; `[10.0.1.5]:80` -> `10.0.1.5]`; bare `2001:db8::1` -> `2001:db8:`. The resulting junk strings are added to the allow set (line 97) while the actual hostname `2001:db8::1` is absent, so `http_request('http://[2001:db8::1]:8443/')` (urlparse hostname `2001:db8::1`) and run_python connections to it are both falsely BLOCKED; the task becomes unsolvable with no useful diagnostic. Duplicate/case handling is otherwise fine (set + lower()).",
+  "fix_hint": "Parse with `urlsplit(\"//\" + part)` or handle brackets explicitly: if part starts with '[' and contains ']', take the bracketed host and ignore the rest; else only rsplit the port when the part has exactly one ':'. Add a table-driven test for ip:port, url:port/path, [v6]:port, bare v6, duplicates and case.",
+  "evidence": "Code matches the claim: headless_solver.py:94 `part = re.sub(r\"^https?://\", \"\", part).strip(\"[]\").split(\"/\")[0]` and L95 `host = part.rsplit(\":\", 1)[0] if \":\" in part else part` turn `[2001:db8::1]:8443` into `2001:db8::1]`, `[10.0.1.5]:80` into `10.0.1.5]`, and bare `2001:db8::1` into `2001:db8:`; L97 adds the junk to the set while the real hostname (urlparse hostname `2001:db8::1`) is absent, so _target_lock_block (L125-127) blocks the assigned target. Real parse defect, but TSecBench targets are IPv4 VPN addresses (10.0.x.x per prompts.py/net_tools.py) so the bracketed/IPv6 form does not occur in practice - latent, corrected to low."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 239,
+  "severity": "low",
+  "category": "dead-code",
+  "summary": "`last_progress_step` is written in three places and never read — leftover of the deleted hint stall gate",
+  "detail": "`ctx.deps.last_progress_step = ...` is written at 239 (submit tool), 297 (check_findings), and 532 (rescue path), each with comments referencing \"the hint stall gate\". No code in backend/ reads the field after construction; `request_hint` is gated only by `hint_used`. Dead state plus comments that misdescribe current behavior.",
+  "fix_hint": "Delete the field (backend/deps.py:49) and its three writes, or re-implement the stall gate deliberately and consume it."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 362,
+  "severity": "low",
+  "category": "dead-code",
+  "summary": "`scenario` plumbing in the solver is inert, and the module docstring misstates the target lock's basis",
+  "detail": "`scenario=_guess_scenario(meta)` fills `HeadlessDeps.scenario` (backend/deps.py:54), which is never read anywhere — the target lock is purely structural (`_target_lock_block` matches `deps.allowed_hosts` parsed from `connection_info`, lines 101-134), and time budgeting uses `_time_limit_for_challenge` in the swarm separately. The prompts.py module docstring (line 7) claims `_guess_scenario` is used \"to pick a per-challenge time budget and to gate the target lock\" — the lock claim is false; the function's own docstring (prompts.py:65) says the opposite: \"never affects the target lock, which is purely structural\".",
+  "fix_hint": "Drop the `scenario=` argument and the field, or consume it; correct the prompts.py module docstring to remove the target-lock claim."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 362,
+  "severity": "low",
+  "category": "dead-code",
+  "summary": "Dead state from removed subsystems: scenario, use_vision and last_progress_step are written but never read (plus stale 'hint stall gate' comments and the unused resume_context param).",
+  "detail": "Repo-wide grep (excluding .venv): `scenario=_guess_scenario(meta)` is stored on deps (deps.py:54) and read nowhere; `use_vision` is set at 344/350 (deps.py:29) and read nowhere; `last_progress_step` is written at 239, 297, 532 with comments calling it progress 'for the hint stall gate' although request_hint now says 'there is no gate' (255-259). `resume_context` (constructor param 328, used at 411-412 to append text to the system prompt) is a leftover of the deleted checkpoint/resume subsystem (rewrite-plan §6) and is always empty in the only production call site (swarm.py:148).",
+  "fix_hint": "Delete the four items (or wire last_progress_step to an actual gate), and drop the stale comments; this also removes the misleading prompts.py docstring cross-reference."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 411,
+  "severity": "low",
+  "category": "dead-code",
+  "summary": "`resume_context` is dead surface that contradicts the documented delete-list",
+  "detail": "`if self.resume_context: system_prompt += \"\\n\\n\" + self.resume_context` (411-412) is never exercised: the only constructor caller passes `resume_context=\"\"` (backend/agents/swarm.py:148). docs/rewrite-plan.md §6 explicitly deletes checkpoint/resume, so the parameter and branch are dead configuration surface that makes the plan and the code disagree.",
+  "fix_hint": "Remove the parameter and branch; if checkpoint/resume is wanted later, restore it deliberately with the plan updated."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 489,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "Cross-solver findings bus is inert: normal exits never populate `findings_summary`",
+  "detail": "The swarm posts to the message bus only when `result.findings_summary` is non-empty (backend/agents/swarm.py:334-337), but `_findings` is assigned only on the error/no-tools path (486, 503) and the rescue paths (510, 513, 538) — a normal `return self._result(GAVE_UP)` (489) always carries `findings_summary=\"\"`, and the FLAG_FOUND path is typically empty too. Consequently `check_findings()` can only ever answer \"No new findings\", and `bump()` always receives the fallback \"No sibling insights available yet.\" (swarm.py:169): the sibling knowledge sharing that docs/rewrite-plan.md §4 keeps is a no-op in practice.",
+  "fix_hint": "Capture a bounded progress note (recent tool outcomes / last model text) into `_findings` before returning GAVE_UP/FLAG_FOUND so the bus and bump carry real content."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 491,
+  "severity": "low",
+  "category": "concurrency",
+  "summary": "`asyncio.CancelledError` is swallowed and converted into a normal return, breaking cancellation semantics for any supervisor",
+  "detail": "`except asyncio.CancelledError: ... return self._result(CANCELLED, cancel_reason=reason)` (491-500) absorbs the cancellation instead of re-raising it. Consequences: `task.cancel(); await task` returns a value instead of raising, `task.cancelled()` is False, `asyncio.timeout()` never raises TimeoutError when its inner coroutine absorbs the cancel, and anyio cancel scopes / TaskGroup-adjacent supervision cannot observe shutdown. The current swarm tolerates it (it drives cancellation through `cancel_event` plus shields), but the solver silently defeats the standard asyncio contract it is embedded in.",
+  "fix_hint": "After recording state (including the confirmed-flag check), re-`raise` the CancelledError; let the caller map it to a SolverResult if needed (e.g. wrap the await in `_run_solver` and catch there).",
+  "evidence": "Code behavior is as claimed: headless_solver.py:491-500 catches asyncio.CancelledError and runs `return self._result(CANCELLED, cancel_reason=reason)` without re-raising, so a task.cancel()'ed solver task completes with a value and task.cancelled() is False. However, every in-repo supervisor is cancellation-tolerant (swarm.py:454-456 `p.cancel(); await asyncio.gather(*pending, return_exceptions=True)`; coordinator_core.py:184-189 re-raises at the swarm layer), no asyncio.timeout/anyio cancel scope wraps the solver, and the conversion is deliberate (comment at :493-495). Real contract violation but latent-only in this codebase -> severity corrected to low."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 518,
+  "severity": "low",
+  "category": "maintainability",
+  "summary": "Step accounting is a shared-mutable-list hack mutated from three modules and introspected via getattr",
+  "detail": "`self._step_count = [0]` (369) is mutated by TracingToolset (backend/agents/tracing_toolset.py:37), by the rescue path (`self._step_count[0] += 1`, line 518), and read back through private introspection in the swarm: `getattr(getattr(solver, \"_step_count\", None), \"__getitem__\", lambda _: 0)(0)` (swarm.py:507). Rescue submissions inflate \"steps\" that measure neither model turns nor tool calls, the web progress estimate derived from it is meaningless, and any refactor to a real counter object silently degrades swarm status output to 0.",
+  "fix_hint": "Expose a proper property/method (`steps`, `progress()`) on the solver incremented only by the toolset, and have the swarm use it instead of reaching into a mutable list."
+ },
+ {
+  "file": "backend/agents/headless_solver.py",
+  "line": 569,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "Usage delta baseline resets across solver instances, duplicating previously recorded tokens in retry/resume traces",
+  "detail": "The delta math reads the cumulative `cost_tracker.by_agent[self.agent_name]` (562) against per-instance baselines `_traced_input_tokens` etc. initialized to 0 (374-377). `agent_name` is only `f\"{meta.name}/{self.model_id}\"` (366) and the cost tracker is shared across solver instances: the early-exit retry re-queues the challenge (backend/agents/coordinator_core.py:131-141) and resume spawns a fresh swarm, so a second instance's first `_result` emits a usage event equal to ALL previously recorded tokens for that name. scripts/analyze_traces.py sums `usage` events per run, so retried/resumed runs report inflated costs.",
+  "fix_hint": "Seed `_traced_*` from the current `by_agent` snapshot in `start()`, or emit usage events from the run's own `result.usage` delta instead of the globally cumulative value."
+ },
+ {
+  "file": "backend/agents/swarm.py",
+  "line": 116,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "Workdir slug is not injective and lets '.'/'..' through, so distinct challenges/models can share or escape the workspaces root",
+  "detail": "swarm.py:115-116: re.sub(r'[^A-Za-z0-9._-]+', '-', s).strip('-') or 'x'. Dot-only names survive: _slug('..') == '..', so _workdir_for (swarm.py:106-120) can resolve to <state_dir>/<model_spec> instead of <state_dir>/workspaces/<...>. The mapping is also lossy: 'A B' and 'A-B' (and 'a b' vs 'A-B' on case-insensitive Windows) collapse to one directory, as do model specs 'x/y' and 'x-y'; two different challenges/solvers then share one run_python cwd and TMP dir (local_exec.py:44-63) exactly where the prompt warns about cross-task contamination (prompts.py:167-169).",
+  "fix_hint": "Make the component injective and safe: reject/short-circuit '.' and '..', normalise case, and append a short hash of the original string, e.g. f'{safe}-{sha1(original)[:8]}'."
+ },
+ {
+  "file": "backend/agents/swarm.py",
+  "line": 133,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "Budget floors can exceed the remaining global budget, contradicting the documented clamp",
+  "detail": "swarm.py:66-67 clamps with max(60, min(limit, int(remaining_global_seconds))), so with 10s of run budget left a challenge is still granted 60s; _create_solver then computes time_budget = max(300, limit - 60) (swarm.py:132-137), so with 120s left the solver's own deadline (surfaced to the model via task_status, headless_solver.py:278-287) claims ~5 minutes. This contradicts the docstring at swarm.py:53-58 ('can never be handed a time limit longer than what is actually left of the WHOLE run').",
+  "fix_hint": "Apply the 60s/300s floors only when the global budget is untracked; otherwise clamp after flooring: limit = min(limit, remaining) and budget = min(budget, remaining - margin)."
+ },
+ {
+  "file": "backend/agents/swarm.py",
+  "line": 295,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "Solver creation happens outside the try and its failure is silently swallowed — a model can vanish with no log and a misleading 'finished' status",
+  "detail": "_create_solver(model_spec) is called before the try block in _run_solver (swarm.py:295), so a failure inside it — e.g. _workdir_for's mkdir (swarm.py:118-119) on a Windows-reserved slug ('con', 'nul'), a >MAX_PATH path, or a permissions error — escapes the task; run() retrieves it via task.result() and does 'except Exception: continue' (swarm.py:449-451) without logging. The model simply disappears: no solver entry, get_status() shows it as 'finished' with 0 steps (swarm.py:496-506), and the operator gets no signal.",
+  "fix_hint": "Wrap solver creation in the try (or catch and log it in run()), and harden _workdir_for against reserved/invalid directory names."
+ },
+ {
+  "file": "backend/agents/swarm.py",
+  "line": 410,
+  "severity": "low",
+  "category": "concurrency",
+  "summary": "Partial-stall watchdog ignores the pause state and withdraws an operator-paused multi-flag swarm",
+  "detail": "The watchdog condition (swarm.py:410-414) looks only at _last_progress_monotonic and confirmed_flag; it never consults pause_event. While paused, _run_solver_loop stops starting solver turns (swarm.py:327-328), so no accepts happen; after partial_stall_seconds (default 600) the watchdog fires with reason 'stall_watchdog' (swarm.py:425), cancels the swarm and posts 'no new flag was accepted for 600s'. The coordinator then sees a swarm that ended without a result (coordinator_core.py:121-134), so an operator pause long enough to intervene can silently end the challenge.",
+  "fix_hint": "Treat self.pause_event.is_set() as paused time in the watchdog (skip the check while paused and refresh _last_progress_monotonic on resume)."
+ },
+ {
+  "file": "backend/agents/swarm.py",
+  "line": 497,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "get_status precedence makes the agent state 'won' unreachable and reports not-yet-started solvers as 'finished'.",
+  "detail": "In get_status, `if self.cancel_event.is_set(): agent_status = \"cancelled\"` (backend/agents/swarm.py:498-499) is checked before `elif self.winner and self.winner.flag: agent_status = \"won\"` (L502-503), and every path that sets winner also sets cancel_event first (L340-341 sibling_win, L461-462 swarm_complete) — so the winning solver renders as 'cancelled' in the web console (backend/webui/index.html styles and status text) and the 'won' branch is dead. Relatedly, with no solver registered yet the chain falls through to the initial 'finished' (L497, L504-505), so a just-spawned swarm shows every agent as finished for the moment before its solvers start.",
+  "fix_hint": "Check winner before cancel_event, and emit a distinct 'starting' state when solver is None and the swarm is neither cancelled nor paused."
+ },
+ {
+  "file": "backend/agents/swarm.py",
+  "line": 498,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "get_status() reports every agent of a solved swarm as 'cancelled'; the 'won' branch is unreachable",
+  "detail": "swarm.py:498-505 checks cancel_event before winner, but winner is only assigned immediately after cancel_with_reason('sibling_win') (swarm.py:340-341), and run() likewise cancels before returning (swarm.py:453-457); when the task list drains it sets cancel_event 'swarm_complete' (swarm.py:461). Consequently a swarm that found a flag reports 'cancelled' for all agents (the winner included) and the 'won' branch at :502-503 can never be reached — affecting /status output (coordinator_loop.py:337-345) and the web console snapshot.",
+  "fix_hint": "Check winner (terminal success) before the cancel/pause branches, or clear the cancelled display when winner is set."
+ },
+ {
+  "file": "backend/agents/swarm.py",
+  "line": 507,
+  "severity": "low",
+  "category": "maintainability",
+  "summary": "get_status()'s getattr(__getitem__) hack silently returns 0 for int-typed solvers and can raise KeyError for dict-typed ones",
+  "detail": "swarm.py:507: getattr(getattr(solver, '_step_count', None), '__getitem__', lambda _: 0)(0). It works today only because HeadlessSolver._step_count is a one-element list cell (headless_solver.py:369); nothing in SolverProtocol (solver_base.py:20-33) requires that. An int-typed cell silently yields 0 steps/progress, and a dict-typed cell raises KeyError — swallowed in web.py:70-73 but unguarded in _print_status (coordinator_loop.py:341), where it would abort the scheduler event loop.",
+  "fix_hint": "Give SolverProtocol a step_count property/field and read it directly; at minimum use getattr(solver, '_step_count', [0])[0]."
+ },
+ {
+  "file": "backend/cli.py",
+  "line": 442,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "The model smoke test reports success when zero models were tested (`ok == len(results)` is 0 == 0).",
+  "detail": "`model_specs = [s.strip() for s in model_specs if s.strip()]` (backend/cli.py:410) can empty the list (e.g. `--models \"\"`), so the loop runs no tests; then `ok = sum(...)` is 0 (L439) and `if ok == len(results):` prints the green '大模型 API Key 可正常调用。' (L442-443) above a '0/0 通过' line (L441), instead of failing loudly.",
+  "fix_hint": "Guard for an empty model_specs list (fail with an error exit code) and require len(results) > 0 before declaring success."
+ },
+ {
+  "file": "backend/deps.py",
+  "line": 49,
+  "severity": "low",
+  "category": "dead-code",
+  "summary": "Write-only dataclass fields: HeadlessDeps.{cost_tracker,meta,use_vision,scenario,last_progress_step}, CoordinatorDeps.challenge_time_limit_seconds and ChallengeSwarm.challenge_dir",
+  "detail": "Set but never read anywhere in the repo (grep-verified): deps.py:28 meta, :29 use_vision, :30 cost_tracker, :49 last_progress_step, :54 scenario (last_progress_step is written at headless_solver.py:239/297/532 and its comment describes a 'hint stall gate' that no longer exists); deps.py:66 challenge_time_limit_seconds is filled by build_deps (coordinator_loop.py:121-124) while every consumer reads settings.challenge_time_limit_seconds directly (swarm.py:60); swarm.py:75 challenge_dir is passed by all callers (coordinator_core.py:112, cli.py:289) and never read in swarm.py.",
+  "fix_hint": "Delete the unused fields (or start reading them) so the dependency contracts stop advertising capability the code does not use."
+ },
+ {
+  "file": "backend/loop_detect.py",
+  "line": 12,
+  "severity": "low",
+  "category": "missing-test",
+  "summary": "LoopDetector has no tests despite non-trivial signature/threshold logic",
+  "detail": "`LoopDetector.check` (23+) builds sha1 signatures over full argument payloads, gates non-dict args, and drives the window/warn/break transitions consumed by the tracer. Nothing tests identical vs rotated arguments, the large-payload case the code comment explicitly calls out (the 500-char prefix truncation regression), empty args, or window eviction — a regression here would silently change loop telemetry for every solver run.",
+  "fix_hint": "Unit-test threshold transitions (None -> warn -> break), window rollover, and full-args hashing including the long-shared-prefix case."
+ },
+ {
+  "file": "backend/models.py",
+  "line": 88,
+  "severity": "low",
+  "category": "missing-test",
+  "summary": "Qwen URL/mode normalization and the spec parsing helpers are untested pure functions.",
+  "detail": "resolve_model's qwen branch rewrites the base URL and api_mode with non-obvious rules ('/responses' suffix forces responses mode, '/chat/completions' forces chat, otherwise the setting wins — backend/models.py:88-107), and model_id_from_spec/provider_from_spec (L162-170) parse specs. All are pure and network-free; given that the shipped defaults already mismatch (see the qwen api_mode finding), table-driven tests would lock the intended behavior.",
+  "fix_hint": "Add tests/test_models.py with cases for both URL suffixes, neither suffix, an invalid QWEN_API_MODE, and multi-segment specs."
+ },
+ {
+  "file": "backend/models.py",
+  "line": 173,
+  "severity": "low",
+  "category": "dead-code",
+  "summary": "Helpers left over from the removed multi-provider design are dead code.",
+  "detail": "`effort_from_spec` (backend/models.py:173-176) and `context_window` (L186-188) plus the CONTEXT_WINDOWS table they feed (L49-54) have zero call sites anywhere in backend/ or scripts/ (grep-verified); VISION_MODELS (L57) is an empty set, so `supports_vision` (L181-183), which is still called at backend/agents/headless_solver.py:344, can only ever return False.",
+  "fix_hint": "Delete the unused helpers/table, or wire context_window into a real context-budget check; keep VISION_MODELS only if a vision model is actually planned."
+ },
+ {
+  "file": "backend/platforms.py",
+  "line": 5,
+  "severity": "low",
+  "category": "docs",
+  "summary": "Module docstring advertises a \"local replay adapter\" that does not exist after the rewrite.",
+  "detail": "platforms.py:5 claims the TSecBench adapter \"and the local replay adapter\" implement the protocol, but there is exactly one implementation in the tree and no replay adapter is referenced anywhere else in the repo. It misstates the interface's real coverage for reviewers and for anyone adding a second backend.",
+  "fix_hint": "Update the docstring to describe the single implementation (or state explicitly that the protocol is currently single-backend)."
+ },
+ {
+  "file": "backend/platforms.py",
+  "line": 27,
+  "severity": "low",
+  "category": "dead-code",
+  "summary": "SubmitResult.confirmed and PlatformIdentity are dead code — nothing in the repo references them.",
+  "detail": "`confirmed` (lines 27-29) duplicates a membership test that swarm.py hand-rolls instead (\"already_solved\" at swarm.py:249, \"correct\" at swarm.py:256); a repo-wide search finds no `.confirmed` access. `PlatformIdentity` (lines 44-51) is referenced only by its own definition. Dead helpers invite drift: a status added to one place will not be reflected in the other.",
+  "fix_hint": "Either use `result.confirmed` at the swarm call sites (and wire PlatformIdentity into a status display) or delete both before the upstream PR."
+ },
+ {
+  "file": "backend/poller.py",
+  "line": 111,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "The suspicious-data guard uses `// 2`, so it is a no-op for 1 known challenge and accepts responses that already lost half the list, which can wipe known state and trip the false 'all solved' exit.",
+  "detail": "`if self._known_challenges and len(current_names) < len(self._known_challenges) // 2:` — with 1 known challenge the threshold is 0 and the check can never fire; with 3 known, a response containing 1 challenge passes. A single error response from `fetch_all_challenges` (which returns `[]` on any HTTP/parse error, tsec_platform.py:122-131) is then accepted and lines 135-136 overwrite `_known_challenges`/`_known_stubs` with the empty result; the solved-regression guard below cannot catch it when nothing is solved yet (`if self._known_solved and not current_solved` requires a previously non-empty solved set). With `known_challenges` emptied, the guard is permanently disabled and the scheduler's termination condition (coordinator_loop.py:299) declares 'All challenges solved' — the same silent-no-op failure as the seed case.",
+  "fix_hint": "Use the literal 'fewer than half' test (`len(current_names) * 2 < len(self._known_challenges)`) and additionally treat any empty result as suspicious once a non-empty set was known (or when the adapter's fetch raised), never overwriting known state with a zero-length list."
+ },
+ {
+  "file": "backend/prompts.py",
+  "line": 7,
+  "severity": "low",
+  "category": "docs",
+  "summary": "Module docstring contradicts the implementation and the function's own docstring about the target lock",
+  "detail": "The module docstring says \"`_guess_scenario` survives only to pick a per-challenge time budget and to gate the target lock\" (7), but the lock is purely structural — `_target_lock_block` (headless_solver.py:101-134) matches `deps.allowed_hosts` parsed from `connection_info` and never consults `scenario` — and the function's own docstring at line 65 states the opposite: \"never affects the target lock, which is purely structural\". Two docstrings disagree; the module one is wrong.",
+  "fix_hint": "Correct the module docstring to drop the target-lock claim (leave only the time-budget role)."
+ },
+ {
+  "file": "backend/prompts.py",
+  "line": 7,
+  "severity": "low",
+  "category": "docs",
+  "summary": "prompts.py docstring claims _guess_scenario is kept 'to gate the target lock'; the lock is purely structural and ignores it.",
+  "detail": "The module docstring (lines 5-7) says the classifier 'survives only to pick a per-challenge time budget and to gate the target lock, never to shape the prompt text'. The budget use is real (swarm.py:62-65 gives killchain tasks a longer limit), but the lock is built solely from _parse_allowed_hosts and its own comment states 'no scenario/keyword guess can open it' (headless_solver.py:102-107); the deps.scenario field fed from line 362 is never read. Combined with the still-present keyword classifier, the docstring makes the removed behavior look load-bearing.",
+  "fix_hint": "Correct the docstring to say the classifier only affects the time budget (or remove _guess_scenario in favor of a simple config knob), and delete the scenario plumbing."
+ },
+ {
+  "file": "backend/prompts.py",
+  "line": 150,
+  "severity": "low",
+  "category": "docs",
+  "summary": "Prompt contract omits the flag shape that the rescue path depends on",
+  "detail": "docs/rewrite-plan.md:93 requires the prompt to state \"flag 形态与 `submit_flag` 语义\", but `build_headless_prompt` lists only submit_flag semantics (153); the flag shape is never given. The solver's own fallback hard-assumes it: `_extract_flag_candidates` (headless_solver.py:51-58) and `_flag_inner` (66-70) only recognize `flag{...}`/`CTF{...}`, so for any task whose tokens use another shape the rescue silently finds nothing, and the model is never told the shape its fallback expects.",
+  "fix_hint": "Add the expected flag shape (and that verbatim tokens must be submitted, not narrated) to the \"## Constraints\" block, or derive the rescue pattern from challenge metadata."
+ },
+ {
+  "file": "backend/tools/core.py",
+  "line": 12,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "do_submit_flag reports multi-flag partial credit as confirmed, ending the run early in the fallback submit path.",
+  "detail": "`is_confirmed = result.status in (\"correct\", \"already_solved\")` ignores `challenge_complete`; tsec_platform.py:242-252 returns status 'correct' with challenge_complete=False for a partial multi-flag accept, and swarm.try_submit_flag deliberately returns confirmed=False in that case (swarm.py:256-266). Callers of the fallback (headless_solver.py:231-235 when deps.submit_fn is None, and the final-output rescue at 525-527) then set `ctx.deps.confirmed_flag`/`_confirmed`, so run_until_done_or_gave_up returns FLAG_FOUND (and in a swarm context triggers cancel_with_reason('sibling_win')) although flags remain unclaimed. Latent in today's wiring (swarm always injects submit_fn) but wrong for any standalone `HeadlessSolver(..., submit_fn=None)` use of this shared helper.",
+  "fix_hint": "Mirror the swarm contract: is_confirmed = (status == 'already_solved') or (status == 'correct' and result.challenge_complete) (with a single-flag fallback when the platform omits totals), and add a test using a 2-flag partial accept.",
+  "evidence": "Claim matches the code. core.py:12 `is_confirmed = result.status in (\"correct\", \"already_solved\")` ignores `challenge_complete`; tsec_platform.py:243-252 returns status `correct` with `complete = total_count > 0 and correct_count >= total_count` (False for a partial multi-flag accept), and swarm.py:259-270 deliberately returns confirmed=False in exactly that case (`if result.challenge_complete or not multi_flag: ... return result.display, False`). Fallback callers headless_solver.py:233-235 and 525-527 would set confirmed_flag/_confirmed and end the run as FLAG_FOUND with flags unclaimed. Latent: HeadlessSolver is constructed only at swarm.py:138, which always injects submit_fn (L145), so no in-repo path reaches the buggy fallback today - corrected to low."
+ },
+ {
+  "file": "backend/tools/core.py",
+  "line": 29,
+  "severity": "low",
+  "category": "dead-code",
+  "summary": "IMAGE_EXTS_FOR_VISION is unused despite the 'kept for prompt hints' comment.",
+  "detail": "Repo-wide grep finds no consumer of IMAGE_EXTS_FOR_VISION (no prompts.py vision hint, and the related deps.use_vision flag is itself never read), so this table is dead code in an audited module — leftover from the removed vision/attachment path.",
+  "fix_hint": "Delete the table (or implement the vision hint it presumes in prompts.build_headless_prompt and use it from there)."
+ },
+ {
+  "file": "backend/tools/local_exec.py",
+  "line": 49,
+  "severity": "low",
+  "category": "missing-test",
+  "summary": "The guard preamble is security-critical string codegen with zero tests.",
+  "detail": "The preamble (49-70) is where every documented socket bypass lives (connect_ex, _socket.socket base class, UDP sendto, asyncio/Proactor on Windows, direct use of _orig_connect); nothing compiles it or asserts which API surface is wrapped. No test file exists in the repo despite pytest being declared in pyproject.",
+  "fix_hint": "Generate the preamble in a test, exec it with a stub snippet, and assert that connect/connect_ex/create_connection/sendto are all guarded and that the original names are not reachable from user code."
+ },
+ {
+  "file": "backend/tools/local_exec.py",
+  "line": 54,
+  "severity": "low",
+  "category": "safety",
+  "summary": "Non-connect egress paths (UDP sendto/sendmsg, DNS resolution helpers) escape the guard.",
+  "detail": "`_guard` is only reached from the connect/create_connection wrappers; `socket.socket(AF_INET, SOCK_DGRAM).sendto(b'x', ('other-host', 53))` and `sendmsg` need no connect and reach arbitrary hosts, and `socket.gethostbyname`/`getaddrinfo`/`gethostbyaddr` issue resolver queries for arbitrary names (the audit's gethostbyname leak). This makes the function docstring's degraded claim ('localhost only', lines 35-37) and the solver's 'ALL outbound network access is locked' message inaccurate.",
+  "fix_hint": "Wrap sendto/sendmsg with the same destination check (and consider allowing DNS only for allowed hosts, or explicitly documenting resolution as out of scope)."
+ },
+ {
+  "file": "backend/tools/local_exec.py",
+  "line": 77,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "run_python leaks the mkstemp fd every call, and the fallback cleanup silently never deletes the file on Windows.",
+  "detail": "`Path(tempfile.mkstemp(suffix=\".py\", prefix=\"agent_\", dir=run_dir)[1])` discards the returned fd with no `os.close`, leaking one OS-level descriptor per tool call (long runs accumulate one per run_python invocation). On Windows the still-open handle makes `tmp.unlink(missing_ok=True)` raise PermissionError (WinError 32), swallowed by the bare `except Exception: pass` at lines 128-130 — so the 'clean up the shared-temp fallback' path in the finally block never actually cleans up there.",
+  "fix_hint": "`fd, name = tempfile.mkstemp(...); os.close(fd); tmp = Path(name)` before writing, so the handle is released and the fallback unlink works on Windows."
+ },
+ {
+  "file": "backend/tools/local_exec.py",
+  "line": 103,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "Timeout kill only terminates the direct child; grandchildren keep running after the tool call returns.",
+  "detail": "On timeout, `proc.kill()` kills just the spawned interpreter. Any process the snippet started (a background server, a long-running tool) survives, keeps ports/files and consumes host resources while the solver believes the call was killed. On POSIX the fix requires spawning with start_new_session=True and killing the group; on Windows TerminateProcess has no tree semantics either.",
+  "fix_hint": "Spawn with start_new_session=True and on timeout signal the process group (os.killpg) on POSIX; on Windows use a job object or `taskkill /T` fallback."
+ },
+ {
+  "file": "backend/tools/net_tools.py",
+  "line": 33,
+  "severity": "low",
+  "category": "missing-test",
+  "summary": "do_raw_http URL normalization and do_tcp_send framing/decode/truncation are untested.",
+  "detail": "The scheme-prepend/lstrip rewrite (46-47 — the half of the empty-host lock bypass), the 24k truncation, follow_redirects behavior, and _decode_payload's hex-over-payload precedence have no tests anywhere in the repo (pyproject declares pytest but no test files exist). A test asserting that a host-less URL is rejected, or that redirects are re-checked, would have caught the findings above.",
+  "fix_hint": "Add unit tests using an httpx MockTransport for URL handling/redirect policy, and direct tests for _truncate/_decode_payload and the read-loop deadline."
+ },
+ {
+  "file": "backend/tracing.py",
+  "line": 11,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "_sanitize strips only '/' and ' ', so Windows-hostile characters in a challenge or model id make the tracer constructor raise.",
+  "detail": "`_sanitize` replaces only '/' and ' ' (backend/tracing.py:11-12) and the resulting name is opened unguarded in __init__ (`self._fh = open(self.path, \"a\")`, L22) at logs/trace-{challenge}-{model_id}-{ts}.jsonl (L21). On Windows ':' is illegal in file names and '\\' is a path separator; a model id with a ':' suffix (a real naming style — see genai-prices ids like 'qwen/qwen-plus-2025-07-28:thinking') or any backslash in the challenge name raises OSError/FileNotFoundError inside HeadlessSolver.__init__ (construction at backend/agents/headless_solver.py:365), taking down the solver rather than just its trace file.",
+  "fix_hint": "Whitelist sanitize ([A-Za-z0-9._-]) and wrap the open in try/except with a fallback filename, so tracing can never fail a solver spawn."
+ },
+ {
+  "file": "backend/tracing.py",
+  "line": 42,
+  "severity": "low",
+  "category": "maintainability",
+  "summary": "tool_call serializes args outside the tracer's exception guard, and all truncations are silent.",
+  "detail": "`args_str = args if isinstance(args, str) else json.dumps(args)` (backend/tracing.py:43) runs before `_write`'s try/except (L35-40) — the guard exists precisely so tracing failures cannot break the solver, yet this one line can raise (non-JSON-serializable values such as bytes/Decimal in tool args) into the solver's tool path. Additionally, args are cut at 2000 chars, results at 2000 and model text at 1000 (L44, L47, L50) with no `truncated` marker, so scripts/analyze_traces.py cannot distinguish a complete payload from a truncated one.",
+  "fix_hint": "Move the serialization inside _write (e.g. json.dumps(..., default=str) wrapped in the same try) and add a `truncated: true` flag when the payload is cut."
+ },
+ {
+  "file": "backend/tsec_platform.py",
+  "line": 156,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "Challenge and solved caches are only ever added to, never reconciled with the newest listing.",
+  "detail": "`fetch_all_challenges` writes into `_challenge_index` (line 156) and `_solved_cache` (158-159) but never removes entries missing from the newest payload, and `fetch_solved_names` answers from the cache without refetching once the index is populated (163-166). A long-lived adapter can therefore resolve submit_flag/release_challenge/fetch_hint lookups (182-193, 307-316, 266-275) for a challenge that no longer exists to a stale unique_code, and can report a stale solved set. Impact is latent in a single-round process (the poller path always refetches via fetch_poll_state), but the state is wrong by construction.",
+  "fix_hint": "Rebuild `_challenge_index` from scratch on each fetch (and drop `_solved_cache` names absent from the payload)."
+ },
+ {
+  "file": "backend/tsec_platform.py",
+  "line": 331,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "Both retry loops sleep after their final failed attempt and log incorrect attempt counters.",
+  "detail": "start_challenge's `range(6)` (line 331) still sleeps up to 14s after the 6th failed 409 (line 350) before falling through to the raise (353-354), and its \"(x/5)\" message (347-348) can print \"(6/5)\". close_challenge's `range(4)` (line 371) likewise sleeps 15s after the 4th failure (387/394) before raising (395-396), and `min(attempt + 1, 3)` makes attempts 3 and 4 both log \"(3/3)\" (384-385, 391-392). The dead waits run on the teardown/failure path where the slot is still held.",
+  "fix_hint": "Skip the sleep on the final iteration and report attempt counts from the actual loop bound without the min() clamp."
+ },
+ {
+  "file": "backend/tsec_platform.py",
+  "line": 344,
+  "severity": "low",
+  "category": "maintainability",
+  "summary": "Retry and fatal-state classification hinge on untested, unversioned human-readable message substrings with no shared constants.",
+  "detail": "The only trigger for the capacity backoff is `409 and \"max active\" in body` (line 344); the only trigger for surfacing a dead task is `\"already finished\" in body or \"task_not_found\" in body` (lines 122-123). These prose substrings are the entire coupling to platform semantics. If the server rewords a message, the start path silently stops waiting (spawn failures escalate to deferrals instead of retrying) and the fatal-state guard degrades a finished task into a swallowed empty list — the exact failure mode the guard exists to prevent. Nothing pins these strings: no constants, no fixtures, no tests.",
+  "fix_hint": "Prefer structured `code` fields from the JSON error body, extract shared constants, and pin them with recorded fixtures."
+ },
+ {
+  "file": "backend/tsec_platform.py",
+  "line": 422,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "Cached container addresses are reused with no freshness check, so a recycled or closed range can be handed to a solver as its target.",
+  "detail": "The reuse branch (lines 420-423) prefers `_started_addrs` whenever the fresh challenge dict has no addr, ignoring the freshly fetched `container_status` (normalized at line 151) and applying no TTL. Entries are removed only on a successful close (line 397), so after an invalid/failed close or a platform-side recycle the cached address is served as `connection_info`; the solver burns budget on an unreachable target, and the coordinator's early-exit retry re-pulls into the same cached entry instead of revalidating. Compounds with the close-4xx defect above (entry never popped on the raise path).",
+  "fix_hint": "Only reuse when the fresh listing still reports container_status == \"available\"; otherwise delete the entry and go through start+poll."
+ },
+ {
+  "file": "backend/web.py",
+  "line": 160,
+  "severity": "low",
+  "category": "concurrency",
+  "summary": "The websocket out queue is unbounded while the pusher enqueues a full snapshot every second regardless of client backpressure.",
+  "detail": "`out: asyncio.Queue = asyncio.Queue()` (backend/web.py:160) has no maxsize; pusher unconditionally put_nowait's `{\"type\": \"state\", **build_snapshot(...)}` every 1.0 s (L164-167) while sender drains it (L169-172). If a client stalls (throttled tab, slow link), the queue grows without bound — each message contains every challenge and every swarm's status — until the socket is eventually closed.",
+  "fix_hint": "Use maxsize=1 with drop-oldest semantics for state pushes (or skip enqueuing when the previous state message is still pending); keep the lossless path only for trace events."
+ },
+ {
+  "file": "backend/web.py",
+  "line": 162,
+  "severity": "low",
+  "category": "dead-code",
+  "summary": "The server-side `watching` variable is assigned but never read.",
+  "detail": "`watching: tuple[str, str] | None = None` (backend/web.py:162) is set on watch (L199), cleared on unwatch (L210), and resurrected only as `_ = watching` at L222 purely to silence linters — it carries no state used by the tail/snapshot logic.",
+  "fix_hint": "Remove the variable (and the `_ = watching` line), or actually use it (e.g. include the current watch target in build_snapshot output)."
+ },
+ {
+  "file": "backend/webui/index.html",
+  "line": 201,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "The console's status filter list lacks 'preparing' although the server emits that status, so preparing challenges vanish under every non-'all' filter.",
+  "detail": "STATUSES = [\"all\",\"active\",\"deferred\",\"unsolved\",\"solved\"] (backend/webui/index.html:201) while the snapshot produces 'preparing' (backend/web.py:34-44 `_challenge_status` returns it for names in deps.pending_spawns). The local rank table knows the status (index.html:225 `{ active:0, preparing:1, ... }`) but the filter is `c.status === filter` (L227), so a challenge being started is only visible under 'all'.",
+  "fix_hint": "Add \"preparing\" to STATUSES so it gets a filter button and stays visible while spawning."
+ },
+ {
+  "file": "backend/webui/index.html",
+  "line": 237,
+  "severity": "low",
+  "category": "safety",
+  "summary": "Platform-provided value/level/status are interpolated into innerHTML without esc(), unlike name/category.",
+  "detail": "The challenge row builds `...${c.value||0} 分${c.level?` · L${c.level}`:''}...` and `class=\"pill ${c.status}\"` raw (backend/webui/index.html:236-237) while name and category are escaped with esc() (L235/L237, helper at L345). Those fields are passed through verbatim from the TSecBench API response (`stub.get(\"value\", 0)` / `stub.get(\"level\", 0)` / server-computed status, backend/web.py:57-65), so a malformed or crafted platform payload can inject markup/script into the operator console.",
+  "fix_hint": "Wrap every interpolation in esc() (a numeric coercion for value/level would also do), keeping one consistent escaping rule for the whole row."
+ },
+ {
+  "file": "backend/webui/index.html",
+  "line": 309,
+  "severity": "low",
+  "category": "maintainability",
+  "summary": "onTrace has no fallback branch, so several events the solver emits never appear in the watch panel.",
+  "detail": "The if/else chain (backend/webui/index.html:309-319) covers tool_call/tool_result/flag_confirmed/error/usage/bump/finish/start/model_response/loop_detected, but the solver also emits target_lock_block (backend/agents/headless_solver.py:162-166 and 185-189), target_lock_degraded (L395-400) and findings_injected (backend/agents/tracing_toolset.py:65) — events with no branch are silently dropped, so the operator watching a solver cannot see that egress was refused by the target lock, which is a core steering signal in this codebase.",
+  "fix_hint": "Add a final `else addEv(\"meta\", ev.type || \"event\", trunc(JSON.stringify(stripTs(ev))), ev.step)` so unknown event types are visible instead of invisible."
+ },
+ {
+  "file": "scripts/analyze_traces.py",
+  "line": 53,
+  "severity": "low",
+  "category": "correctness",
+  "summary": "_SCENARIO_WORDS claims it is kept in sync with prompts.py::_guess_scenario but has drifted, mis-classifying exploit-type runs as 'web'.",
+  "detail": "backend/prompts.py:76-77 maps 挖掘/审计/安全测试/cve and comfyui/gradio/ollama/dify to 'exploit'; the copy at scripts/analyze_traces.py:54-66 stops after ('rce','poc','利用','exp_') at L58, so runs whose only signals are those words fall through to the default 'web' (guess_scenario, L69, applied at L276), skewing the per-scenario rate tables even though the comment above the tuple says 'kept in sync manually' (L51-52).",
+  "fix_hint": "Import the classifier from backend.prompts (the package is importable) or delete the manual copy so there is one word table."
+ }
+]

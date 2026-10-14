@@ -135,22 +135,35 @@ def resolve_model(spec: str, settings: Settings) -> Model:
                     timeout=httpx.Timeout(connect=30.0, read=300.0, write=120.0, pool=30.0),
                 ),
             )
+            # DeepSeek's chat-completions API expects the output cap under
+            # `max_tokens` (the OpenAI `max_completion_tokens` field would be
+            # rejected/ignored). Pin the profile accordingly.
             return OpenAIChatModel(
                 model_id,
                 provider=OpenAIProvider(openai_client=client),
+                profile={"openai_chat_supports_max_completion_tokens": False},
             )
         case _:
             raise ValueError(f"Unknown provider: {provider} (expected deepseek, qwen, or glm)")
 
 
 def resolve_model_settings(spec: str) -> ModelSettings:
-    """Get provider-specific model settings with caching enabled."""
+    """Get provider-specific model settings.
+
+    The output cap must not exceed what each provider actually accepts:
+    DeepSeek's chat API rejects `max_tokens` above 8192 (V3) / 65536
+    (reasoner); GLM and Qwen cap at 32K. Values above the limit are not
+    "safer" — some endpoints 400 on them.
+    """
     provider = spec.split("/", 1)[0]
+    model_id = model_id_from_spec(spec)
     match provider:
         case "deepseek":
             # OpenAI-compatible chat endpoint; server-side prompt caching is
-            # automatic. Cap output tokens to avoid reserving the full context.
-            return OpenAIChatModelSettings(max_tokens=128_000)
+            # automatic. Cap output tokens so a run can never reserve the
+            # full context window as output.
+            limit = 65536 if "reasoner" in model_id else 8192
+            return OpenAIChatModelSettings(max_tokens=limit)
         case "glm" | "qwen":
             # GLM-5.x thinking models and qwen-plus top out at 32K output;
             # keep the limit explicit so long tool conversations are accepted.

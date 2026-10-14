@@ -47,6 +47,10 @@ ignore = ["E501", "SIM105", "SIM115", "PTH123"]
 [tool.ruff.lint.isort]
 known-first-party = ["backend"]
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
 [tool.ty.rules]
 unresolved-import = "ignore"
 

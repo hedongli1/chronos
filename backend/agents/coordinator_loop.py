@@ -296,14 +296,35 @@ async def run_event_loop(
                     await _auto_spawn_unsolved(deps, poller)
 
             # Clean termination: everything solved and nothing in flight.
+            # Positive evidence required: only a SUCCESSFUL poll may declare
+            # the run finished. A failed first poll (VPN down, transient 5xx)
+            # used to leave known_challenges empty and exit instantly with an
+            # empty result set — a false "all solved" success.
             unsolved_set = poller.known_challenges - poller.known_solved
             active_now = any(not t.done() for t in deps.swarm_tasks.values())
-            if not unsolved_set and not active_now and not deps.pending_spawns:
+            if poller.last_poll_ok and not unsolved_set and not active_now and not deps.pending_spawns:
                 logger.info("All challenges solved; scheduler exiting.")
                 break
+            if not poller.last_poll_ok and not active_now and not deps.pending_spawns:
+                # Nothing is running and the platform has never answered even
+                # one poll — exiting cleanly here would fake a completed run.
+                logger.error(
+                    "No successful platform poll yet (%d consecutive failures); "
+                    "refusing to exit as if the benchmark were solved.",
+                    poller.consecutive_failures,
+                )
+                raise RuntimeError(
+                    "Platform never answered a poll — check VPN/BENCHMARK_TOKEN "
+                    "and re-run. (This failure is deliberate: an empty challenge "
+                    "list is not proof of completion.)"
+                )
 
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Scheduler shutting down...")
+    except RuntimeError:
+        # Fatal platform/poller state — propagate so the CLI reports failure
+        # with a non-zero exit instead of printing a fake "Final Results".
+        raise
     except Exception as e:
         logger.error("Scheduler fatal: %s", e, exc_info=True)
     finally:

@@ -46,6 +46,11 @@ logger = logging.getLogger(__name__)
 FLAG_TOKEN_RE = re.compile(r"(?i)(?:flag|CTF)\{[^{}\r\n]{1,256}\}")
 TOOL_MAX_RETRIES = 8
 TASK_TIME_BUDGET_SECONDS = 55 * 60  # platform hard limit is 60 min per task
+# Max auto-submissions from the final-output rescue path. Each wrong rescue
+# submission feeds the swarm-wide circuit breaker, so a model that dumps many
+# fake flag-shaped strings in its closing text must not be able to cancel
+# every sibling solver.
+RESCUE_MAX_SUBMITS = 3
 
 
 def _extract_flag_candidates(text: str) -> list[str]:
@@ -85,14 +90,24 @@ def _is_rejected_variant(candidate: str, rejected: list[str]) -> bool:
 
 
 def _parse_allowed_hosts(connection_info: str) -> frozenset[str]:
-    """Extract the assigned target hosts from connection_info ("ip:port, ip:port")."""
+    """Extract the assigned target hosts from connection_info ("ip:port, ip:port").
+
+    Handles plain hosts ("10.0.0.5:80"), bracketed hosts ("[::1]:80") and
+    scheme-prefixed entries ("http://10.0.0.5:80").
+    """
     hosts: set[str] = set()
     for part in re.split(r"[,\s]+", connection_info or ""):
         part = part.strip()
         if not part:
             continue
-        part = re.sub(r"^https?://", "", part).strip("[]").split("/")[0]
-        host = part.rsplit(":", 1)[0] if ":" in part else part
+        part = re.sub(r"^https?://", "", part)
+        part = part.split("/")[0]
+        if part.startswith("["):
+            # Bracketed host (IPv6 literal): "[::1]:80" -> "::1".
+            end = part.find("]")
+            host = part[1:end] if end != -1 else part[1:]
+        else:
+            host = part.rsplit(":", 1)[0] if ":" in part else part
         if host:
             hosts.add(host.lower())
     return frozenset(hosts)
@@ -123,7 +138,15 @@ def _target_lock_block(deps: HeadlessDeps, host: str) -> str | None:
             "run_python still works for local computation (localhost only)."
         )
     h = (host or "").strip().lower()
-    if not h or h in deps.allowed_hosts:
+    if not h:
+        # An unparsable/empty hostname is NOT in the allowed set — never fail
+        # open (a caller can smuggle '//host' past urlparse). Block loudly.
+        return (
+            "BLOCKED (target lock): the request URL has no parseable host. "
+            "Pass an explicit host (e.g. http://10.0.x.x:port/path), not a "
+            "relative or scheme-only URL."
+        )
+    if h in deps.allowed_hosts:
         return None
     targets = ", ".join(sorted(deps.allowed_hosts))
     return (
@@ -164,7 +187,10 @@ def _build_toolset(
                 degraded=not ctx.deps.allowed_hosts,
             )
             return block
-        return await do_raw_http(url, method=method, headers=headers, body=body, timeout=timeout)
+        return await do_raw_http(
+            url, method=method, headers=headers, body=body, timeout=timeout,
+            allowed_hosts=ctx.deps.allowed_hosts,
+        )
 
     @toolset.tool
     async def tcp_send(
@@ -329,6 +355,7 @@ class HeadlessSolver:
         allow_exec: bool = True,
         time_budget_seconds: int = TASK_TIME_BUDGET_SECONDS,
         workdir: str = "",
+        no_submit: bool = False,
     ) -> None:
         self.model_spec = model_spec
         self.model_id = model_id_from_spec(model_spec)
@@ -340,6 +367,7 @@ class HeadlessSolver:
         self.resume_context = resume_context
         self.allow_exec = allow_exec
         self.time_budget_seconds = time_budget_seconds
+        self.no_submit = no_submit
 
         self.use_vision = supports_vision(model_spec)
         parsed_hosts = _parse_allowed_hosts(meta.connection_info)
@@ -355,6 +383,7 @@ class HeadlessSolver:
             notify_coordinator=notify_coordinator,
             allow_exec=allow_exec,
             workdir=workdir,
+            no_submit=no_submit,
             flags_total=max(1, meta.flag_count),
             flags_accepted=meta.correct_flag_count,
             deadline_monotonic=time.monotonic() + time_budget_seconds,
@@ -366,6 +395,7 @@ class HeadlessSolver:
         self.agent_name = f"{meta.name}/{self.model_id}"
         self._agent: Agent[HeadlessDeps, str] | None = None
         self._messages: list = []
+        self._pending_bump: ModelRequest | None = None
         self._step_count = [0]
         self._flag: str | None = None
         self._confirmed: bool = False
@@ -443,14 +473,21 @@ class HeadlessSolver:
 
         t0 = time.monotonic()
         steps_before = self._step_count[0]
+        usage_acc = None  # filled below; kept for the exception paths
 
         try:
-            from pydantic_ai.usage import UsageLimits
+            from pydantic_ai.usage import RunUsage, UsageLimits
 
+            # Fresh per-call accumulator passed INTO the run: if the run is
+            # cancelled or crashes, whatever accumulated so far is still
+            # readable here (pydantic-ai mutates the passed object in place),
+            # so interrupted runs keep their token accounting.
+            usage_acc = RunUsage()
             result = await self._agent.run(
                 "Solve this task." if not self._messages else "Continue solving.",
                 deps=self.deps,
-                message_history=self._messages if self._messages else None,
+                message_history=self._message_history_for_run(),
+                usage=usage_acc,
                 usage_limits=UsageLimits(request_limit=None),
             )
 
@@ -464,6 +501,7 @@ class HeadlessSolver:
                 duration_seconds=duration,
             )
             self._messages = result.all_messages()
+            self._pending_bump = None  # consumed by this run (it was in the history)
 
             output = result.output
             if isinstance(output, str) and output.strip():
@@ -472,8 +510,13 @@ class HeadlessSolver:
                 # task's final summary can legitimately list several captured
                 # flags, and the old "only if there's exactly one" rule
                 # silently dropped all of them whenever that happened.
-                for candidate in _extract_flag_candidates(output):
+                for rescued, candidate in enumerate(_extract_flag_candidates(output)):
                     if self.deps.confirmed_flag:
+                        break
+                    if rescued >= RESCUE_MAX_SUBMITS:
+                        self._findings += (
+                            f"; further final-text flags dropped (rescue cap {RESCUE_MAX_SUBMITS})"
+                        )
                         break
                     await self._submit_final_output_candidate(candidate)
             if self.deps.confirmed_flag:
@@ -490,6 +533,7 @@ class HeadlessSolver:
 
         except asyncio.CancelledError:
             reason = getattr(self.cancel_event, "reason", "") or "unknown"
+            self._record_interrupted_usage(usage_acc, duration=time.monotonic() - t0)
             # The run can be cancelled between the platform's flag confirmation
             # and this return (sibling win, wall-clock kill, ...). A confirmed
             # flag is a solve regardless of the cancellation.
@@ -500,9 +544,40 @@ class HeadlessSolver:
             return self._result(CANCELLED, cancel_reason=reason)
         except Exception as e:
             logger.error(f"[{self.agent_name}] Error: {e}", exc_info=True)
+            self._record_interrupted_usage(usage_acc, duration=time.monotonic() - t0)
             self._findings = f"Error: {e}"
             self.tracer.event("error", error=str(e))
+            # Mirror the cancellation guard: a flag confirmed right before an
+            # unrelated crash is still a solve — never discard it.
+            if self.deps.confirmed_flag and not self._confirmed:
+                self._confirmed = True
+                self._flag = self._flag or self.deps.confirmed_flag
+                self.tracer.event("flag_confirmed_after_error", flag=self._flag)
+                return self._result(FLAG_FOUND, cancel_reason=f"error: {e}")
             return self._result(ERROR)
+
+    def _message_history_for_run(self) -> list | None:
+        """History for the next run: previous messages plus any pending bump."""
+        history: list = list(self._messages)
+        if self._pending_bump is not None:
+            history.append(self._pending_bump)
+        return history or None
+
+    def _record_interrupted_usage(self, usage_acc, duration: float) -> None:
+        """Record tokens consumed before a cancelled/failed run.
+
+        The passed-in RunUsage accumulator keeps whatever pydantic-ai added to
+        it before the interruption — without this, cancelled runs (wall-clock
+        kill, sibling win, operator stop) silently lost their whole token bill.
+        """
+        if usage_acc is not None and usage_acc.has_values():
+            self.cost_tracker.record(
+                self.agent_name,
+                usage_acc,
+                self.model_id,
+                provider_spec=provider_from_spec(self.model_spec),
+                duration_seconds=duration,
+            )
 
     async def _submit_final_output_candidate(self, candidate: str) -> None:
         """Rescue a flag token emitted as final text instead of a tool call."""
@@ -538,7 +613,13 @@ class HeadlessSolver:
             self._findings += f"; auto-submission result: {display[:300]}"
 
     def bump(self, insights: str) -> None:
-        """Inject sibling insights and prepare to resume."""
+        """Inject sibling insights and prepare to resume.
+
+        Stored as a PENDING bump, consumed by the next run's message history.
+        (Previously the bump was appended to self._messages directly, and a
+        bump landing mid-run was silently discarded when the run loop
+        reassigned self._messages = result.all_messages().)
+        """
         bump_msg = ModelRequest(
             parts=[
                 UserPromptPart(
@@ -553,7 +634,7 @@ class HeadlessSolver:
                 )
             ]
         )
-        self._messages.append(bump_msg)
+        self._pending_bump = bump_msg
         self.loop_detector.reset()
         self.tracer.event("bump", insights=insights[:500])
         logger.info(f"[{self.agent_name}] Bumped with sibling insights")

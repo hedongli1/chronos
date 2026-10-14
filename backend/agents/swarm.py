@@ -149,6 +149,7 @@ class ChallengeSwarm:
             allow_exec=bool(getattr(self.settings, "allow_local_exec", True)),
             time_budget_seconds=time_budget,
             workdir=self._workdir_for(model_spec),
+            no_submit=self.no_submit,
         )
 
     def _make_notify_fn(self, model_spec: str):
@@ -186,6 +187,11 @@ class ChallengeSwarm:
     async def try_submit_flag(self, flag: str, model_spec: str) -> tuple[str, bool]:
         """Cooldown-gated, deduplicated flag submission. Returns (display, is_confirmed)."""
         async with self._flag_lock:
+            if self.no_submit:
+                # Dry run: NEVER touch the platform (defence in depth — the
+                # solver-side guard is the primary stop, this is the backstop).
+                return f'DRY RUN — would submit "{flag.strip()}"', False
+
             normalize_flag = getattr(self.platform, "normalize_flag", None)
             normalized = (
                 normalize_flag(flag)
@@ -244,18 +250,43 @@ class ChallengeSwarm:
             try:
                 result = await self.platform.submit_flag(self.meta.name, flag)
             except Exception as e:
-                return f"submit_flag error: {e}", False
+                # Transport/API error is NOT a judgment: don't burn the flag so
+                # it can be retried, don't feed the circuit breaker.
+                self._submitted_flags.discard(normalized)
+                return (
+                    f"submit_flag error: {e}. The platform did not judge this flag; "
+                    "you may retry it after the connection recovers.",
+                    False,
+                )
+
+            if result.status not in ("correct", "already_solved", "incorrect"):
+                # 'unknown' covers challenge-not-found, invalid_state and other
+                # infra/platform states — none of them says "wrong flag". Count
+                # them neither as a guess nor as a submit; the flag stays
+                # retryable and the circuit breaker is untouched.
+                self._submitted_flags.discard(normalized)
+                return (
+                    result.display
+                    + "\nSUBMIT WASN'T JUDGED — the platform did not evaluate this "
+                    "flag (infrastructure/state error, not a wrong answer). It was "
+                    "not counted against you and may be retried.",
+                    False,
+                )
 
             if result.status == "already_solved":
                 self.confirmed_flag = normalized
                 self._confirmed_flags.add(normalized)
                 self._accepted_flags.add(normalized)
                 self._last_progress_monotonic = time.monotonic()
+                self._push_flag_progress(result.progress or f"{self.meta.flag_count}/{self.meta.flag_count} flags")
                 return result.display, True
 
             if result.status == "correct":
                 self._last_progress_monotonic = time.monotonic()
                 self._accepted_flags.add(normalized)
+                # Keep every live solver's task_status truthful: parse the
+                # platform's "x/y flags" progress and push it into their deps.
+                self._push_flag_progress(result.progress)
                 multi_flag = max(1, self.meta.flag_count) > 1
                 if result.challenge_complete or not multi_flag:
                     self.confirmed_flag = normalized
@@ -290,6 +321,24 @@ class ChallengeSwarm:
                     False,
                 )
             return result.display, False
+
+    def _push_flag_progress(self, progress: str) -> None:
+        """Push the platform's accepted-flag count into every live solver.
+
+        `progress` looks like "2/3 flags" (see SubmitResult.progress). Without
+        this, a solver's task_status() tool reports the count frozen at spawn
+        time even after its sibling confirmed new flags — contradicting the
+        prompt's "task_status is ground truth" contract.
+        """
+        m = re.search(r"(\d+)\s*/\s*(\d+)", progress or "")
+        if not m:
+            return
+        accepted, total = int(m.group(1)), int(m.group(2))
+        for solver in self.solvers.values():
+            deps = getattr(solver, "deps", None)
+            if deps is not None:
+                deps.flags_accepted = accepted
+                deps.flags_total = max(deps.flags_total, total)
 
     async def _run_solver(self, model_spec: str) -> SolverResult | None:
         solver = self._create_solver(model_spec)

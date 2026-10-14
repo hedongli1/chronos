@@ -36,16 +36,37 @@ async def do_raw_http(
     headers: dict[str, Any] | None = None,
     body: str = "",
     timeout: float = DEFAULT_TIMEOUT,
+    allowed_hosts: frozenset[str] | None = None,
+    max_redirects: int = 5,
 ) -> str:
-    """Full-control HTTP request to any live target (challenge ranges included).
+    """Full-control HTTP request to a live target (challenge ranges included).
 
     Returns a verbatim transcript: status line, response headers, body.
+
+    allowed_hosts: when given, every hop (initial URL and each redirect) is
+    checked against this allowlist. Redirects to an off-scope host are NOT
+    followed — the transcript reports the block instead. This keeps the
+    target lock structural even when an in-scope service 302s elsewhere.
     """
+    from urllib.parse import urlparse as _urlparse
+
     if not url.strip():
         return "http_request error: empty url"
-    if not url.startswith(("http://", "https://")):
-        url = "http://" + url.lstrip("/")
 
+    def _checked_hop(hop: str) -> str | None:
+        """Return a block message when this hop's host is outside scope, else None."""
+        if allowed_hosts is None:
+            return None
+        host = (_urlparse(hop).hostname or "").strip().lower()
+        if host and host not in allowed_hosts:
+            return (
+                f"http_request error: redirect target '{host}' is outside the "
+                f"authorized scope ({', '.join(sorted(allowed_hosts))}). "
+                "The redirect was NOT followed."
+            )
+        return None
+
+    current = url if url.startswith(("http://", "https://")) else "http://" + url.lstrip("/")
     req_headers = _normalize_headers(headers)
     content: str | bytes | None = body or None
     if req_headers.get("Content-Type", "").startswith("application/json") and isinstance(body, str) and body:
@@ -54,22 +75,40 @@ async def do_raw_http(
         except Exception:
             pass  # send as-is; some tasks need malformed JSON on purpose
 
+    transcript_parts: list[str] = []
+
     try:
         async with httpx.AsyncClient(
             verify=False,
             timeout=timeout,
-            follow_redirects=True,
+            follow_redirects=False,
             trust_env=False,
         ) as client:
-            resp = await client.request(method.upper(), url, headers=req_headers, content=content)
-            header_lines = "\n".join(f"{k}: {v}" for k, v in resp.headers.items())
-            out = (
-                f"HTTP {resp.status_code} {resp.reason_phrase}\n"
-                f"URL: {resp.url}\n"
-                f"--- response headers ---\n{header_lines or '(none)'}\n"
-                f"--- response body ---\n{resp.text or '(empty)'}"
-            )
-            return _truncate(out)
+            for _hop in range(max_redirects + 1):
+                block = _checked_hop(current)
+                if block:
+                    return block
+                resp = await client.request(method.upper(), current, headers=req_headers, content=content)
+                header_lines = "\n".join(f"{k}: {v}" for k, v in resp.headers.items())
+                transcript_parts.append(
+                    f"HTTP {resp.status_code} {resp.reason_phrase}\n"
+                    f"URL: {resp.url}\n"
+                    f"--- response headers ---\n{header_lines or '(none)'}\n"
+                    f"--- response body ---\n{resp.text or '(empty)'}"
+                )
+                if resp.is_redirect and resp.headers.get("location"):
+                    current = str(resp.headers["location"])
+                    # relative Location resolves against the previous URL
+                    if not current.startswith(("http://", "https://")):
+                        current = str(httpx.URL(resp.url).join(current))
+                    continue
+                break
+            else:
+                return (
+                    "http_request error: too many redirects "
+                    f"(>{max_redirects}) — giving up."
+                )
+        return _truncate("\n\n=== redirect hop ===\n\n".join(transcript_parts))
     except Exception as e:
         return f"http_request error: {type(e).__name__}: {e}"
 
