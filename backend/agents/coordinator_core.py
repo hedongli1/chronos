@@ -94,6 +94,11 @@ async def _start_reserved_swarm(deps: CoordinatorDeps, challenge_name: str) -> s
                     reaped = await reaper(keep)
                     if reaped:
                         logger.warning("Reaped ghost containers: %s", reaped)
+                        # A reaped container no longer occupies a slot — drop it
+                        # from the local accounting too, or the capacity gate
+                        # stays wedged for the rest of the run.
+                        for reaped_name in reaped:
+                            deps.open_containers.discard(reaped_name)
                         deps.coordinator_inbox.put_nowait(
                             f"GHOST REAP: closed stale platform containers {reaped} after "
                             f"spawn of '{challenge_name}' failed ({e}). It will be retried."
@@ -134,7 +139,11 @@ async def _start_reserved_swarm(deps: CoordinatorDeps, challenge_name: str) -> s
             # immediately — that would burn a container start + a full model run
             # for nothing. A fast early-exit (likely a transient startup problem)
             # is labeled as such but follows the same cooldown-gated retry.
-            steps = result.step_count if result else 0
+            # When no solver returned a result the swarm still knows the max
+            # steps its solvers reached — a swarm that ground for 200 steps
+            # with no flag is a real attempt, not a startup failure, so label
+            # it accurately rather than as a 0-step early exit.
+            steps = result.step_count if result else getattr(swarm, "max_steps_seen", 0)
             note = (
                 f"early exit ({steps} steps)"
                 if steps < EARLY_EXIT_MIN_STEPS
@@ -199,7 +208,9 @@ async def _recover_challenge_environment(deps: CoordinatorDeps, challenge_name: 
 
     The local slot is freed only when the platform confirms the close — a failed
     close means the container still occupies a platform slot, and pretending
-    otherwise causes max-active rejections on later starts.
+    otherwise causes max-active rejections on later starts. One immediate retry
+    is attempted; only a confirmed failure keeps the entry counted (the next
+    ghost reap or a fresh /close on re-pull can still reconcile it).
     """
     release = getattr(deps.platform, "release_challenge", None)
     if callable(release):
@@ -209,8 +220,18 @@ async def _recover_challenge_environment(deps: CoordinatorDeps, challenge_name: 
             logger.warning("Could not release challenge environment for %s: %s", challenge_name, e)
             released = False
         if released is False:
+            # Transient close failures are common (range controller 5xx) —
+            # one quick retry before concluding the slot is truly stuck.
+            await asyncio.sleep(2.0)
+            try:
+                released = await release(challenge_name)
+            except Exception as e:
+                logger.warning("Retry release for %s failed: %s", challenge_name, e)
+                released = False
+        if released is False:
             logger.warning(
-                "Container for %s may still occupy a platform slot; keeping it counted",
+                "Container for %s may still occupy a platform slot; keeping it counted "
+                "(the ghost reaper or a re-pull can reconcile it later)",
                 challenge_name,
             )
             return

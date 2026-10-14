@@ -2,14 +2,22 @@
 
 
 async def do_submit_flag(platform, challenge_name: str, flag: str) -> tuple[str, bool]:
-    """Submit a flag. Returns (display_message, is_confirmed)."""
+    """Submit a flag. Returns (display_message, is_confirmed).
+
+    is_confirmed means "this challenge is now fully solved" — a correct flag on
+    a multi-flag task is only *partial* credit and must NOT end the run early.
+    """
     flag = flag.strip()
     if not flag:
         return "Empty flag — nothing to submit.", False
 
     try:
         result = await platform.submit_flag(challenge_name, flag)
-        is_confirmed = result.status in ("correct", "already_solved")
+        is_confirmed = result.status in ("correct", "already_solved") and (
+            result.challenge_complete
+            if hasattr(result, "challenge_complete")
+            else True
+        )
         return result.display, is_confirmed
     except Exception as e:
         return f"submit_flag error: {e}", False
@@ -23,16 +31,3 @@ async def do_check_findings(message_bus, model_spec: str) -> str:
     if not findings:
         return "No new findings from other agents."
     return message_bus.format_unread(findings)
-
-
-# Image extensions recognized by vision-capable models (kept for prompt hints).
-IMAGE_EXTS_FOR_VISION: dict[str, str] = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".bmp": "image/bmp",
-    ".tiff": "image/tiff",
-    ".tif": "image/tiff",
-    ".webp": "image/webp",
-}

@@ -70,7 +70,22 @@ concurrency 7、missing-test 10、api-compat 2、maintainability 7、dead-code 1
 - M `max_tokens=128000` 超 DeepSeek 上限、映射到 `max_completion_tokens` → 已修
   （DeepSeek profile 固定 `max_tokens`，上限 8192/reasoner 65536）
 
-## 用户追加指示（2026-10-14 二轮）
+## 调整后的轮次计划（用户 2026-10-14 二轮确认）
+
+- **R1 全量审计** ✅（94 条缺陷入库 docs/audit-r1.json）
+- **R2 高危/中危修复** ✅（7 high + 6 medium，24 tests）
+- **R3 缺陷清零**：清完剩余中危 + 高价值低危（安全/正确性优先），静态修复
+- **R4 两个新功能**：findings 漏洞产物输出通道 + opt-in 跨任务记忆子系统（先修订 rewrite-plan 基线，再写码；全部默认关闭，不改变参评行为）
+- **R5 文档沉淀 + 对抗复核**：ADR、README、env.example 同步；只读批判 agent 复核整个 diff
+- **R6 终验与交付**：静态检查（ruff/ty）、提交序列、推送分支、准备 PR
+
+**硬性边界（用户明确要求，全程遵守）**：
+- 办公环境，**禁止任何网络测试与实测**：不调用 DeepSeek/任何模型 API、不探测平台、
+  不连 VPN、不访问 tsecbench 平台页面、不在本地真实运行 Agent 去打靶。
+- 允许：**隔离单测**（pytest 全 mock，不触网、不调模型、不连平台）、静态分析工具
+  （ruff/ty）、静态开发（编辑代码/文档）、git 操作与 GitHub 下载（用户授权）。
+- 测试以隔离单测为主；任何需要真实平台/真实模型才能验证的行为，在 PR 中如实标注
+  "未经实测"边界，绝不越界去跑。
 
 用户澄清：该 Agent 是 TSecBench 平台（https://tsecbench.zc.tencent.com/agent/20786）的
 **Agent 测评**对象；用户要求：

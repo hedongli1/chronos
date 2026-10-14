@@ -34,6 +34,8 @@ class TSecBenchmarkPlatform:
 
     base_url: str = "https://tsecbench.zc.tencent.com"
     token: str = ""
+    # TLS verification (default on; disabled only via explicit operator config).
+    verify_tls: bool = True
 
     _client: httpx.AsyncClient | None = field(default=None, repr=False)
     _challenge_index: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -54,7 +56,7 @@ class TSecBenchmarkPlatform:
             url = self.base_url.rstrip("/")
             self._client = httpx.AsyncClient(
                 base_url=url + "/",
-                verify=False,
+                verify=self.verify_tls,
                 timeout=30.0,
                 # Direct connection: the platform is a domestic service and must
                 # not depend on a local proxy that the VPN tunnel can break.
@@ -130,6 +132,7 @@ class TSecBenchmarkPlatform:
             logger.warning("TSec API returned non-list: %s", str(data)[:200])
             return []
         challenges: list[dict[str, Any]] = []
+        fresh_index: dict[str, dict[str, Any]] = {}
 
         for item in data:
             unique_code = item.get("unique_code", "")
@@ -153,11 +156,17 @@ class TSecBenchmarkPlatform:
                 "level": item.get("level", 0),
             }
             challenges.append(normalized)
-            self._challenge_index[name] = normalized
+            fresh_index[name] = normalized
 
             if is_completed:
                 self._solved_cache.add(name)
 
+        # Rebuild the index from the newest listing instead of merging into a
+        # stale copy — container_addr / status / flag counts must reflect the
+        # platform's current state (a cached recycled address would otherwise
+        # be reused with no freshness check). Solved state is terminal on the
+        # platform, so _solved_cache is only ever added to.
+        self._challenge_index = fresh_index
         return challenges
 
     async def fetch_solved_names(self) -> set[str]:
@@ -211,6 +220,23 @@ class TSecBenchmarkPlatform:
                 # still open. Single-flag tasks: duplicate means fully solved.
                 total_flags = int(ch.get("flag_count", 1) or 1)
                 if total_flags > 1:
+                    # A duplicate alone can't say whether the LAST missing
+                    # flag was also banked by a sibling. Ask the platform for
+                    # the current state instead of guessing "still open".
+                    try:
+                        await self.fetch_all_challenges()
+                        fresh = self._challenge_index.get(challenge_name) or {}
+                        if fresh.get("is_completed"):
+                            return SubmitResult(
+                                "already_solved",
+                                message,
+                                f'DUPLICATE — "{flag}" already banked, and the platform '
+                                "now reports the challenge completed.",
+                                challenge_complete=True,
+                                progress="all flags banked",
+                            )
+                    except Exception:
+                        pass  # fall through to the conservative below
                     return SubmitResult(
                         "correct",
                         message,
@@ -314,7 +340,12 @@ class TSecBenchmarkPlatform:
         if not unique_code:
             return False
         try:
-            await self.close_challenge(unique_code)
+            result = await self.close_challenge(unique_code)
+            # A 200 whose payload says closed:false means the range is still
+            # live — report failure so the coordinator keeps counting the slot.
+            if result.get("closed") is False:
+                logger.warning("TSec close %s: platform reports not closed", challenge_name)
+                return False
             logger.info("TSec container closed for %s (%s)", challenge_name, unique_code)
             return True
         except Exception as e:
@@ -342,19 +373,24 @@ class TSecBenchmarkPlatform:
                 except Exception:
                     pass
                 if e.response.status_code == 409 and "max active" in body:
-                    delay = 4.0 + attempt * 2.0
-                    logger.warning(
-                        "TSec start %s: platform at capacity; retrying in %.0fs (%d/5)",
-                        unique_code, delay, attempt + 1,
-                    )
-                    await _aio.sleep(delay)
-                    continue
+                    if attempt < 5:
+                        delay = 4.0 + attempt * 2.0
+                        logger.warning(
+                            "TSec start %s: platform at capacity; retrying in %.0fs (%d/5)",
+                            unique_code, delay, attempt + 1,
+                        )
+                        await _aio.sleep(delay)
+                        continue
+                    # final attempt exhausted
+                    break
                 raise
         if resp is None:
             raise RuntimeError(f"TSec start {unique_code}: platform stayed at capacity after retries")
         addrs = resp.get("container_addr", [])
-        if addrs:
-            self._started_addrs[unique_code] = addrs
+        # Record the start attempt even when the payload carries no address:
+        # a retry must know /start already fired, or it would POST again and
+        # spawn a SECOND range instance for the same task.
+        self._started_addrs[unique_code] = list(addrs)
         return {
             "unique_code": resp.get("unique_code", unique_code),
             "container_addr": addrs,
@@ -376,22 +412,39 @@ class TSecBenchmarkPlatform:
                 )
                 break
             except httpx.HTTPStatusError as e:
-                # 4xx (e.g. invalid_state: already closed) is a terminal answer.
+                # 4xx is a terminal answer. "already closed" style states are
+                # NOT failures — the container no longer occupies a slot, so
+                # report success instead of permanently burning the local
+                # capacity entry. Other 4xx (auth, unknown code) still raise.
                 if e.response.status_code < 500:
+                    body = ""
+                    try:
+                        body = e.response.text
+                    except Exception:
+                        pass
+                    if "already" in body or "invalid_state" in body or "closed" in body:
+                        logger.warning(
+                            "TSec close %s: platform says already closed (%s) — treating as success",
+                            unique_code, body[:120],
+                        )
+                        self._started_addrs.pop(unique_code, None)
+                        return {"unique_code": unique_code, "closed": True}
                     raise
-                delay = (3.0, 8.0, 15.0)[min(attempt, 2)]
-                logger.warning(
-                    "TSec close %s: HTTP %d, retrying in %.0fs (%d/3)",
-                    unique_code, e.response.status_code, delay, min(attempt + 1, 3),
-                )
-                await _aio.sleep(delay)
+                if attempt < 3:
+                    delay = (3.0, 8.0, 15.0)[attempt]
+                    logger.warning(
+                        "TSec close %s: HTTP %d, retrying in %.0fs (%d/3)",
+                        unique_code, e.response.status_code, delay, attempt + 1,
+                    )
+                    await _aio.sleep(delay)
             except (httpx.TransportError, httpx.TimeoutException) as e:
-                delay = (3.0, 8.0, 15.0)[min(attempt, 2)]
-                logger.warning(
-                    "TSec close %s: %s, retrying in %.0fs (%d/3)",
-                    unique_code, type(e).__name__, delay, min(attempt + 1, 3),
-                )
-                await _aio.sleep(delay)
+                if attempt < 3:
+                    delay = (3.0, 8.0, 15.0)[attempt]
+                    logger.warning(
+                        "TSec close %s: %s, retrying in %.0fs (%d/3)",
+                        unique_code, type(e).__name__, delay, attempt + 1,
+                    )
+                    await _aio.sleep(delay)
         if resp is None:
             raise RuntimeError(f"TSec close {unique_code}: failed after retries")
         self._started_addrs.pop(unique_code, None)
@@ -419,7 +472,14 @@ class TSecBenchmarkPlatform:
         # spawns another range instance.
         unique_code = challenge.get("unique_code", "")
         addrs = challenge.get("container_addr", [])
-        if not addrs and unique_code and unique_code in self._started_addrs:
+        container_status = challenge.get("container_status", "stopped")
+        if (
+            not addrs and unique_code and unique_code in self._started_addrs
+            # Only reuse the cached address when the platform's fresh listing
+            # doesn't say the container is stopped — a recycled/closed range
+            # would otherwise hand the solver a dead address.
+            and container_status != "stopped"
+        ):
             addrs = self._started_addrs[unique_code]
         if not addrs and unique_code:
             # Fire /start exactly once, then poll the challenge LIST for the

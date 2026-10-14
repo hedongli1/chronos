@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from backend.message_bus import ChallengeMessageBus
 
 # Type for the deduped submit callback: (flag) -> (display, is_confirmed)
-SubmitFn = Callable[[str], Coroutine[Any, Any, tuple[str, bool]]]
+SubmitFn = Callable[[str], Awaitable[tuple[str, bool]]]
 
 
 @dataclass
@@ -26,14 +26,13 @@ class HeadlessDeps:
     platform: CompetitionPlatform
     challenge_name: str
     meta: ChallengeMeta
-    use_vision: bool
     cost_tracker: CostTracker | None = None
     confirmed_flag: str | None = None
     message_bus: ChallengeMessageBus | None = None
     model_spec: str = ""
     submit_fn: SubmitFn | None = None
     no_submit: bool = False
-    notify_coordinator: Callable[[str], Coroutine[Any, Any, None]] | None = None
+    notify_coordinator: Callable[[str], Awaitable[None]] | None = None
     allow_exec: bool = True
     # Per solver-run working directory for run_python (isolated, kept for
     # post-mortems). Empty = fall back to the shared system temp dir.
@@ -44,14 +43,10 @@ class HeadlessDeps:
     hint_used: bool = False
     # Flags the platform actively rejected this run — never resubmit these.
     rejected_flags: list[str] = field(default_factory=list)
-    # Progress marker for the hint stall gate: step index of the last confirmed
-    # flag, accepted partial credit, or newly received sibling finding.
-    last_progress_step: int = 0
     # Target lock: hosts parsed from the task's connection_info. The solver's
     # own egress is always restricted to these (empty = degraded, localhost
     # only). There is no bypass — purely structural.
     allowed_hosts: frozenset[str] = frozenset()
-    scenario: str = ""
 
 
 @dataclass

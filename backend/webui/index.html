@@ -198,7 +198,7 @@
   }
 
   // ---------- render ----------
-  const STATUSES = ["all","active","deferred","unsolved","solved"];
+  const STATUSES = ["all","active","preparing","deferred","unsolved","solved"];
   function renderFilters() {
     const bar = $("filters");
     bar.innerHTML = "";
@@ -233,8 +233,8 @@
       el.className = "chal" + (c.name === selected ? " sel" : "");
       const flags = c.flag_count > 1 ? ` · ${c.correct_flag_count}/${c.flag_count} flags` : "";
       el.innerHTML = `<div class="nm">${esc(c.name)}</div>
-        <span class="pill ${c.status}">${c.status}</span>
-        <div class="meta">${c.value||0} 分${c.level?` · L${c.level}`:""}${c.category?` · ${esc(c.category)}`:""}${flags}</div>`;
+        <span class="pill ${esc(c.status)}">${esc(c.status)}</span>
+        <div class="meta">${esc(c.value||0)} 分${c.level?` · L${esc(c.level)}`:""}${c.category?` · ${esc(c.category)}`:""}${flags}</div>`;
       el.onclick = () => { selected = c.name; render(); };
       list.appendChild(el);
     });
@@ -317,6 +317,12 @@
     else if (t === "start") addEv("meta", "start", ev.model||"", "");
     else if (t === "model_response" && ev.text) addEv("meta", "model", trunc(ev.text), ev.step);
     else if (t === "loop_detected") addEv("meta", "loop", `${ev.level} on ${ev.tool}`, ev.step);
+    else if (t === "target_lock_block") addEv("err", "lock", `${ev.tool} → ${ev.host||"?"}`, ev.step);
+    else if (t === "target_lock_degraded") addEv("err", "lock", "no target known — all egress refused", "");
+    else if (t === "findings_injected") addEv("meta", "siblings", "shared findings injected", ev.step);
+    else if (t === "hint_requested") addEv("meta", "hint", trunc(ev.hint||""), "");
+    else if (t === "stop") addEv("meta", "stop", `steps=${ev.step_count??""}`, "");
+    else addEv("meta", t, trunc(JSON.stringify(stripTs(ev))||""), ev.step);
   }
   function addEv(cls, tag, body, step) {
     const tr = $("trace");

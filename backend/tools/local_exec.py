@@ -35,6 +35,12 @@ async def do_run_python(
     allowed_hosts: when not None, outbound socket connections from the snippet
     are restricted to these hosts (target lock) plus localhost. An empty set
     means the lock is in its degraded no-target-known state: localhost only.
+    The guard covers connect/connect_ex/sendto/sendmsg, create_connection and
+    the asyncio connection paths. Subprocess escape hatches (subprocess,
+    os.system, os.exec*/spawn*/popen) are refused — child processes would not
+    inherit the in-process patches and would escape the allowlist; set
+    RUN_PYTHON_ALLOW_SUBPROCESS=1 in the environment to opt out (operator
+    decision, documented gap).
 
     workdir: per solver-run working directory. The snippet file is written
     there, the child process runs with it as cwd, and TMP/TEMP/TMPDIR point
@@ -56,17 +62,79 @@ async def do_run_python(
             "    if host and host not in _ALLOWED_HOSTS:\n"
             "        raise PermissionError(f\"target lock: '{host}' is not an assigned target; \"\n"
             "                              f\"allowed: {sorted(_ALLOWED_HOSTS)}\")\n"
+            # connect / connect_ex (the error-code variant must not bypass)
             "_orig_connect = _socket.socket.connect\n"
             "def _connect(self, address):\n"
             "    _guard(address)\n"
             "    return _orig_connect(self, address)\n"
             "_socket.socket.connect = _connect\n"
+            "_orig_connect_ex = _socket.socket.connect_ex\n"
+            "def _connect_ex(self, address):\n"
+            "    _guard(address)\n"
+            "    return _orig_connect_ex(self, address)\n"
+            "_socket.socket.connect_ex = _connect_ex\n"
+            # connectionless UDP egress (sendto / sendmsg) must not bypass
+            "_orig_sendto = _socket.socket.sendto\n"
+            "def _sendto(self, *a):\n"
+            "    if len(a) >= 2: _guard(a[1])\n"
+            "    return _orig_sendto(self, *a)\n"
+            "_socket.socket.sendto = _sendto\n"
+            "_orig_sendmsg = _socket.socket.sendmsg\n"
+            "def _sendmsg(self, buffers, ancdata=(), flags=0, address=None):\n"
+            "    if address is not None: _guard(address)\n"
+            "    return _orig_sendmsg(self, buffers, ancdata, flags, address)\n"
+            "_socket.socket.sendmsg = _sendmsg\n"
+            # create_connection and asyncio paths (Proactor ConnectEx bypasses
+            # the patched connect — guard before delegating)
             "_orig_ce = _socket.create_connection\n"
             "def _create_connection(address, *a, **kw):\n"
             "    _guard(address)\n"
             "    return _orig_ce(address, *a, **kw)\n"
             "_socket.create_connection = _create_connection\n"
-            "del _socket\n"
+            "import asyncio as _asyncio\n"
+            "_orig_occ = _asyncio.open_connection\n"
+            "def _open_connection(host, port=None, *a, **kw):\n"
+            "    _guard((host, port))\n"
+            "    return _orig_occ(host, port, *a, **kw)\n"
+            "_asyncio.open_connection = _open_connection\n"
+            "_orig_loop_cc = _asyncio.BaseEventLoop.create_connection\n"
+            "def _loop_cc(self, protocol_factory, host=None, port=None, *a, **kw):\n"
+            "    if host is not None:\n"
+            "        _guard((host, port))\n"
+            "    return _orig_loop_cc(self, protocol_factory, host, port, *a, **kw)\n"
+            "_asyncio.BaseEventLoop.create_connection = _loop_cc\n"
+            # Child processes do not inherit in-process patches and would
+            # escape the lock entirely. The headless contract promises "no
+            # local toolchain beyond the tools listed", so subprocess escape
+            # hatches are refused (operator can opt out via env flag).
+            "import os as _os, subprocess as _subprocess\n"
+            "def _spawn_error(what):\n"
+            "    if _os.environ.get('RUN_PYTHON_ALLOW_SUBPROCESS') == '1':\n"
+            "        return False\n"
+            "    raise PermissionError(\n"
+            "        f\"target lock: {what} is blocked — subprocesses would escape \"\n"
+            "        \"the network allowlist. Compute in-process (stdlib + installed \"\n"
+            "        \"libraries) instead.\")\n"
+            "_orig_popen = _subprocess.Popen\n"
+            "def _popen(*a, **kw):\n"
+            "    _spawn_error('subprocess')\n"
+            "    return _orig_popen(*a, **kw)\n"
+            "_subprocess.Popen = _popen\n"
+            "_orig_system = _os.system\n"
+            "def _system(cmd):\n"
+            "    _spawn_error('os.system')\n"
+            "    return _orig_system(cmd)\n"
+            "_os.system = _system\n"
+            "for _name in ('execl','execle','execlp','execlpe','execv','execve','execvp','execvpe',\n"
+            "              'spawnl','spawnle','spawnlp','spawnlpe','spawnv','spawnve','spawnvp',\n"
+            "              'spawnvpe','posix_spawn','popen'):\n"
+            "    if hasattr(_os, _name):\n"
+            "        _orig = getattr(_os, _name)\n"
+            "        def _blocked(*a, _orig=_orig, _what=_name, **kw):\n"
+            "            _spawn_error('os.' + _what)\n"
+            "            return _orig(*a, **kw)\n"
+            "        setattr(_os, _name, _blocked)\n"
+            "del _socket, _asyncio, _os, _subprocess\n"
         )
         code = preamble + code
 
@@ -74,7 +142,11 @@ async def do_run_python(
     if workdir:
         run_dir = Path(workdir)
         run_dir.mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mkstemp(suffix=".py", prefix="agent_", dir=run_dir)[1])
+    # mkstemp hands back an open fd — close it immediately so Windows doesn't
+    # hold a lock on the file and no fd leaks per call. The path is used below.
+    fd, tmp_path = tempfile.mkstemp(suffix=".py", prefix="agent_", dir=run_dir)
+    os.close(fd)
+    tmp = Path(tmp_path)
     try:
         tmp.write_text(code, encoding="utf-8")
 
@@ -100,7 +172,21 @@ async def do_run_python(
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except TimeoutError:
-            proc.kill()
+            # Kill the whole process tree, not just the direct child: on
+            # Windows use taskkill /T (the subprocess patch above blocks
+            # children anyway, but this stays correct if it's ever lifted).
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            if sys.platform == "win32":
+                import subprocess as _sp
+
+                _sp.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    timeout=15,
+                )
             await proc.wait()
             return (
                 f"run_python: timed out after {timeout:.0f}s and the process was killed. "

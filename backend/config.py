@@ -38,7 +38,10 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("QWEN_BASE_URL", "DASHSCOPE_BASE_URL", "BAILIAN_BASE_URL"),
     )
     qwen_api_mode: str = Field(
-        default="responses",
+        # The default base URL is DashScope's OpenAI-compatible endpoint,
+        # which speaks chat completions — pairing it with "responses" mode
+        # would post a Responses-API request to a chat endpoint. Use "chat".
+        default="chat",
         validation_alias=AliasChoices("QWEN_API_MODE", "DASHSCOPE_API_MODE"),
     )
     glm_api_key: str = Field(
@@ -60,6 +63,14 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TSECBENCH_BENCHMARK_URL", "BENCHMARK_URL", "BENCHMARK_BASE_URL"),
     )
     benchmark_token: str = Field(default="", validation_alias=AliasChoices("TSECBENCH_BENCHMARK_TOKEN", "BENCHMARK_TOKEN"))
+
+    # TLS verification for the platform client (which carries BENCHMARK_TOKEN).
+    # Default ON. Only disable in MITM environments where the platform's
+    # certificate is replaced by a corporate proxy (security tradeoff).
+    platform_tls_verify: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("PLATFORM_TLS_VERIFY", "TSECBENCH_TLS_VERIFY"),
+    )
 
     # Runtime.
     allow_local_exec: bool = Field(

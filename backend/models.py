@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import itertools
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
-import httpx
+import httpx2
 from openai import AsyncOpenAI
 from pydantic_ai.models import Model
 from pydantic_ai.models.openai import (
@@ -19,6 +19,7 @@ from pydantic_ai.models.openai import (
     OpenAIChatModelSettings,
     OpenAIResponsesModel,
 )
+from pydantic_ai.profiles import ModelProfileSpec
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 
@@ -32,6 +33,15 @@ logger = logging.getLogger(__name__)
 # its model once at startup.
 _deepseek_rr = itertools.count()
 
+# DeepSeek / GLM / DashScope chat endpoints expect the output cap under
+# `max_tokens`; pydantic-ai would otherwise send `max_completion_tokens`
+# (the OpenAI o-series field), which these providers reject or ignore.
+# The key exists on OpenAIModelProfile — cast settles the base-TypedDict check.
+_MAX_TOKENS_WIRE_PROFILE = cast(
+    ModelProfileSpec,
+    {"openai_chat_supports_max_completion_tokens": False},
+)
+
 
 def _deepseek_keys(settings: Settings) -> list[str]:
     keys = [settings.deepseek_api_key] if settings.deepseek_api_key else []
@@ -44,17 +54,6 @@ def _deepseek_keys(settings: Settings) -> list[str]:
 DEFAULT_MODELS: list[str] = [
     "deepseek/deepseek-chat",
 ]
-
-# Context window sizes (tokens)
-CONTEXT_WINDOWS: dict[str, int] = {
-    "deepseek-chat": 128_000,
-    "deepseek-reasoner": 128_000,
-    "qwen-plus": 1_000_000,
-    "glm-5.3": 200_000,
-}
-
-# Models that support vision (none of the supported providers currently do).
-VISION_MODELS: set[str] = set()
 
 
 def resolve_model(spec: str, settings: Settings) -> Model:
@@ -77,6 +76,9 @@ def resolve_model(spec: str, settings: Settings) -> Model:
                     base_url=base_url,
                     api_key=settings.glm_api_key,
                 ),
+                # GLM's OpenAI-compatible endpoint expects `max_tokens`, not
+                # `max_completion_tokens`.
+                profile=_MAX_TOKENS_WIRE_PROFILE,
             )
         case "qwen":
             if not settings.qwen_api_key:
@@ -112,6 +114,9 @@ def resolve_model(spec: str, settings: Settings) -> Model:
                     base_url=raw_url,
                     api_key=settings.qwen_api_key,
                 ),
+                # DashScope compatible-mode chat completions expect
+                # `max_tokens`, not `max_completion_tokens`.
+                profile=_MAX_TOKENS_WIRE_PROFILE,
             )
         case "deepseek":
             keys = _deepseek_keys(settings)
@@ -130,9 +135,9 @@ def resolve_model(spec: str, settings: Settings) -> Model:
                 api_key=keys[key_idx],
                 base_url="https://api.deepseek.com/v1",
                 max_retries=6,
-                http_client=httpx.AsyncClient(
+                http_client=httpx2.AsyncClient(
                     trust_env=False,
-                    timeout=httpx.Timeout(connect=30.0, read=300.0, write=120.0, pool=30.0),
+                    timeout=httpx2.Timeout(connect=30.0, read=300.0, write=120.0, pool=30.0),
                 ),
             )
             # DeepSeek's chat-completions API expects the output cap under
@@ -141,7 +146,7 @@ def resolve_model(spec: str, settings: Settings) -> Model:
             return OpenAIChatModel(
                 model_id,
                 provider=OpenAIProvider(openai_client=client),
-                profile={"openai_chat_supports_max_completion_tokens": False},
+                profile=_MAX_TOKENS_WIRE_PROFILE,
             )
         case _:
             raise ValueError(f"Unknown provider: {provider} (expected deepseek, qwen, or glm)")
@@ -181,21 +186,3 @@ def model_id_from_spec(spec: str) -> str:
 def provider_from_spec(spec: str) -> str:
     """Extract the provider from a spec."""
     return spec.split("/", 1)[0]
-
-
-def effort_from_spec(spec: str) -> str | None:
-    """Extract effort level from a spec like 'claude-sdk/claude-opus-4-6/max'."""
-    parts = spec.split("/")
-    if len(parts) >= 3 and parts[2] in ("low", "medium", "high", "max"):
-        return parts[2]
-    return None
-
-
-def supports_vision(spec: str) -> bool:
-    """Check if a model spec supports vision."""
-    return model_id_from_spec(spec) in VISION_MODELS
-
-
-def context_window(spec: str) -> int:
-    """Get context window size for a model spec."""
-    return CONTEXT_WINDOWS.get(model_id_from_spec(spec), 200_000)

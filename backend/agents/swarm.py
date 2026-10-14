@@ -92,6 +92,9 @@ class ChallengeSwarm:
     findings: dict[str, str] = field(default_factory=dict)
     winner: SolverResult | None = None
     confirmed_flag: str | None = None
+    # Highest step count reached by any solver (survives across bumps; read by
+    # the coordinator when the swarm ends without a flag).
+    max_steps_seen: int = 0
     _flag_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _confirmed_flags: set[str] = field(default_factory=set)  # platform-confirmed (normalized); challenge complete
     _accepted_flags: set[str] = field(default_factory=set)  # platform-accepted incl. multi-flag partials
@@ -113,7 +116,12 @@ class ChallengeSwarm:
         state_dir = getattr(self.settings, "state_dir", ".ctf-state")
 
         def _slug(s: str) -> str:
-            return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-") or "x"
+            slug = re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-")
+            # '.'/'..' survive the regex and would escape the workspaces
+            # directory — collapse them to a safe fallback.
+            if slug in ("", ".", ".."):
+                return "x"
+            return slug
 
         path = Path(state_dir) / "workspaces" / _slug(self.meta.name) / _slug(model_spec)
         path.mkdir(parents=True, exist_ok=True)
@@ -129,12 +137,14 @@ class ChallengeSwarm:
         tool surface."""
         from backend.agents.headless_solver import HeadlessSolver
 
-        time_budget = max(
-            300,
-            _time_limit_for_challenge(
-                self.settings, self.meta, self.remaining_global_seconds
-            ) - 60,
+        limit = _time_limit_for_challenge(
+            self.settings, self.meta, self.remaining_global_seconds
         )
+        # Solver budget = swarm budget minus 60s shutdown margin. The 300s
+        # floor only applies when the clamped limit can actually spare it:
+        # with a global budget running out, the solver must inherit the
+        # remaining time, not invent a budget the run no longer has.
+        time_budget = max(min(max(300, limit - 60), limit), 60)
         return HeadlessSolver(
             model_spec=model_spec,
             meta=self.meta,
@@ -145,7 +155,6 @@ class ChallengeSwarm:
             submit_fn=lambda flag: self.try_submit_flag(flag, model_spec),
             message_bus=self.message_bus,
             notify_coordinator=self._make_notify_fn(model_spec),
-            resume_context="",
             allow_exec=bool(getattr(self.settings, "allow_local_exec", True)),
             time_budget_seconds=time_budget,
             workdir=self._workdir_for(model_spec),
@@ -376,6 +385,10 @@ class ChallengeSwarm:
             while self.pause_event.is_set() and not self.cancel_event.is_set():
                 await asyncio.sleep(0.5)
             result = await solver.run_until_done_or_gave_up()
+            # Highest step count any solver reached — the coordinator's
+            # early-exit heuristic reads this when no solver won, so a swarm
+            # that ground for 200 steps is NOT retried as a "startup failure".
+            self.max_steps_seen = max(self.max_steps_seen, result.step_count)
 
             # Only broadcast useful findings — skip errors and broken solvers
             if (result.status != ERROR
@@ -456,6 +469,10 @@ class ChallengeSwarm:
                 return
             except TimeoutError:
                 pass
+            if self.pause_event.is_set():
+                # Operator paused this swarm deliberately — the stall clock
+                # must not withdraw a paused challenge out from under them.
+                continue
             if (
                 self._last_progress_monotonic
                 and not self.confirmed_flag
@@ -544,16 +561,18 @@ class ChallengeSwarm:
         for spec in self._effective_model_specs():
             solver = self.solvers.get(spec)
             agent_status = "finished"
-            if self.cancel_event.is_set():
+            if self.winner and self.winner.flag:
+                # Check BEFORE cancel_event: a win sets both, and "won" is
+                # the more useful answer than "cancelled" for the panel.
+                agent_status = "won"
+            elif self.cancel_event.is_set():
                 agent_status = "cancelled"
             elif self.pause_event.is_set():
                 agent_status = "paused"
-            elif self.winner and self.winner.flag:
-                agent_status = "won"
             elif solver:
                 agent_status = "running"
 
-            steps = getattr(getattr(solver, "_step_count", None), "__getitem__", lambda _: 0)(0) if solver else 0
+            steps = solver.step_count if solver else 0
             cost = 0.0
             duration = 0.0
             model_name = spec

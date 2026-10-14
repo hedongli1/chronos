@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
 import httpx
@@ -154,6 +155,9 @@ async def do_tcp_send(
 
         chunks: list[bytes] = []
         total = 0
+        # The silence window alone lets a slow-drip service hold the tool call
+        # open forever (one byte every 2.9s). Cap the whole read phase too.
+        overall_deadline = time.monotonic() + read_timeout + keep_open_seconds
         try:
             while total < MAX_TCP_OUTPUT:
                 chunk = await asyncio.wait_for(reader.read(8192), timeout=keep_open_seconds)
@@ -161,6 +165,8 @@ async def do_tcp_send(
                     break
                 chunks.append(chunk)
                 total += len(chunk)
+                if time.monotonic() > overall_deadline:
+                    break
         except TimeoutError:
             pass  # silence window elapsed — that is the normal end of a reply
 

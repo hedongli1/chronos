@@ -130,7 +130,13 @@ def build_deps(
     for d in Path(challenges_root).iterdir():
         meta_path = d / "metadata.yml"
         if meta_path.exists():
-            meta = ChallengeMeta.from_yaml(meta_path)
+            try:
+                meta = ChallengeMeta.from_yaml(meta_path)
+            except Exception as e:
+                # One malformed/truncated metadata.yml (e.g. after a crash
+                # mid-write) must not brick the whole scheduler startup.
+                logger.warning("Skipping unreadable metadata %s: %s", meta_path, e)
+                continue
             if meta.name not in deps.challenge_dirs:
                 deps.challenge_dirs[meta.name] = str(d)
                 deps.challenge_metas[meta.name] = meta
@@ -143,9 +149,14 @@ def _create_platform(settings: Settings) -> CompetitionPlatform:
     mode = getattr(settings, "platform_mode", "tsec")
     if mode in ("tsec", "tsecbench", "benchmark"):
         from backend.tsec_platform import TSecBenchmarkPlatform
+
         base = settings.platform_url or settings.benchmark_url
         token = settings.platform_token or settings.benchmark_token
-        return TSecBenchmarkPlatform(base_url=base, token=token)
+        return TSecBenchmarkPlatform(
+            base_url=base,
+            token=token,
+            verify_tls=bool(getattr(settings, "platform_tls_verify", True)),
+        )
     raise ValueError(f"Unknown platform mode: {mode!r} (expected 'tsec')")
 
 
@@ -398,6 +409,7 @@ async def _handle_resume(deps: CoordinatorDeps, poller, challenge_name: str) -> 
     deps.challenge_attempts.pop(challenge_name, None)
     deps.defer_time.pop(challenge_name, None)
     was_deferred = deps.deferred_challenges.pop(challenge_name, None)
+    deps.spawn_failures.pop(challenge_name, None)  # re-enable resets the failure count
     swarm = deps.swarms.get(challenge_name)
     task = deps.swarm_tasks.get(challenge_name)
     if swarm and task and not task.done() and not swarm.cancel_event.is_set():
@@ -436,9 +448,13 @@ def _handle_bump(deps: CoordinatorDeps, payload: str) -> None:
 
     try:
         data = json.loads(payload)
-        challenge = data["challenge"]
-        model = data["model"]
+        if not isinstance(data, dict):
+            raise TypeError("payload is not an object")
+        challenge = data.get("challenge")
+        model = data.get("model")
         message = str(data.get("message", "")).strip()
+        if not isinstance(challenge, str) or not isinstance(model, str):
+            raise TypeError("challenge/model must be strings")
     except (ValueError, KeyError, TypeError) as e:
         logger.warning("Bad __bump__ payload: %s (%s)", payload[:120], e)
         return
@@ -470,10 +486,14 @@ def _log_status_and_handle_deadlock(
         f"{len(deps.deferred_challenges)} deferred. "
         f"Cost: ${cost_tracker.total_cost_usd:.2f}{budget_note}"
     )
+    # Deadlock = every UNSOLVED challenge is deferred. Stale deferred entries
+    # for challenges that are now solved must not inflate the count and
+    # trigger false deadlocks.
+    unsolved_deferred = unsolved_set & set(deps.deferred_challenges)
     deadlock = (
         not active and not preparing
         and bool(unsolved_set)
-        and len(deps.deferred_challenges) >= len(unsolved_set)
+        and len(unsolved_deferred) >= len(unsolved_set)
     )
     if not deadlock:
         logger.info(status_line)
@@ -527,6 +547,8 @@ async def _auto_spawn_one(deps: CoordinatorDeps, challenge_name: str) -> None:
     try:
         from backend.agents.coordinator_core import do_spawn_swarm
         result = await do_spawn_swarm(deps, challenge_name)
+        # Only a real spawn failure leaves the counter; a clean spawn (or a
+        # capacity refusal that simply means "try later") clears it.
         deps.spawn_failures.pop(challenge_name, None)
         deps.challenge_attempts[challenge_name] = deps.challenge_attempts.get(challenge_name, 0) + 1
         logger.info(f"Auto-spawn {challenge_name} (attempt {deps.challenge_attempts[challenge_name]}): {result[:100]}")

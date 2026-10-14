@@ -2,8 +2,8 @@
 
 This module defines the platform-neutral interface the agent uses to discover
 challenges, submit answers, and synchronize solved state. The TSecBench adapter
-(and the local replay adapter) implement this protocol so the coordinator /
-solver stack stays platform-agnostic.
+implements this protocol so the coordinator / solver stack stays
+platform-agnostic.
 """
 
 from __future__ import annotations
@@ -39,13 +39,3 @@ class CompetitionPlatform(Protocol):
     async def submit_flag(self, challenge_name: str, flag: str) -> SubmitResult: ...
     async def pull_challenge(self, challenge: dict[str, Any], output_dir: str) -> str: ...
     async def close(self) -> None: ...
-
-
-@dataclass(slots=True)
-class PlatformIdentity:
-    """Human-friendly metadata for a connected competition platform."""
-
-    kind: str
-    display_name: str
-    base_url: str = ""
-    connected: bool = False

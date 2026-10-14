@@ -157,13 +157,22 @@ def _build_app(deps, cost_tracker):
     @app.websocket("/ws")
     async def ws(websocket: WebSocket) -> None:
         await websocket.accept()
-        out: asyncio.Queue = asyncio.Queue()
+        # Bounded queue: a slow/stuck client must not let the pusher grow
+        # memory without limit. State snapshots are replaceable — drop the
+        # oldest pending frame when full.
+        out: asyncio.Queue = asyncio.Queue(maxsize=256)
         tail_task: asyncio.Task | None = None
-        watching: tuple[str, str] | None = None
 
         async def pusher() -> None:
             while True:
-                out.put_nowait({"type": "state", **build_snapshot(deps, cost_tracker)})
+                try:
+                    out.put_nowait({"type": "state", **build_snapshot(deps, cost_tracker)})
+                except asyncio.QueueFull:
+                    try:
+                        out.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                    out.put_nowait({"type": "state", **build_snapshot(deps, cost_tracker)})
                 await asyncio.sleep(1.0)
 
         async def sender() -> None:
@@ -196,7 +205,6 @@ def _build_app(deps, cost_tracker):
                     challenge = msg.get("challenge", "")
                     model = msg.get("model", "")
                     _stop_tail()
-                    watching = (challenge, model)
                     path = _solver_trace_path(deps, challenge, model)
                     if path:
                         out.put_nowait({"type": "watch_ok", "challenge": challenge, "model": model})
@@ -207,7 +215,6 @@ def _build_app(deps, cost_tracker):
 
                 elif kind == "unwatch":
                     _stop_tail()
-                    watching = None
         except WebSocketDisconnect:
             pass
         except Exception as e:  # noqa: BLE001
@@ -219,7 +226,6 @@ def _build_app(deps, cost_tracker):
             for t in (pusher_task, sender_task):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await t
-            _ = watching
 
     return app
 

@@ -13,27 +13,28 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from pydantic_ai import Agent, ModelRetry, RunContext
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 from pydantic_ai.toolsets import FunctionToolset
 
+if TYPE_CHECKING:
+    from backend.config import Settings
+
 from backend.cost_tracker import CostTracker
-from backend.deps import HeadlessDeps
+from backend.deps import HeadlessDeps, SubmitFn
 from backend.loop_detect import LoopDetector
 from backend.models import (
     model_id_from_spec,
     provider_from_spec,
     resolve_model,
     resolve_model_settings,
-    supports_vision,
 )
 from backend.platforms import CompetitionPlatform
 from backend.prompts import (
     ChallengeMeta,
-    _guess_scenario,
     build_headless_prompt,
 )
 from backend.solver_base import CANCELLED, ERROR, FLAG_FOUND, GAVE_UP, SolverResult
@@ -259,10 +260,6 @@ def _build_toolset(
             display, confirmed = await do_submit_flag(
                 ctx.deps.platform, ctx.deps.challenge_name, flag
             )
-        if confirmed or display.startswith(("CORRECT", "ALREADY SOLVED")):
-            # Confirmed flag or accepted partial credit: real progress for the
-            # hint stall gate.
-            ctx.deps.last_progress_step = step_counter[0] if step_counter else 0
         if confirmed:
             ctx.deps.confirmed_flag = flag
         else:
@@ -317,11 +314,7 @@ def _build_toolset(
         """Check for new findings from sibling agents working on the same task."""
         from backend.tools.core import do_check_findings
 
-        result = await do_check_findings(ctx.deps.message_bus, ctx.deps.model_spec)
-        if not result.startswith(("No message bus", "No new findings")):
-            # New sibling findings count as progress for the hint stall gate.
-            ctx.deps.last_progress_step = step_counter[0] if step_counter else 0
-        return result
+        return await do_check_findings(ctx.deps.message_bus, ctx.deps.model_spec)
 
     @toolset.tool
     async def notify_coordinator(ctx: RunContext[HeadlessDeps], message: str) -> str:
@@ -346,12 +339,11 @@ class HeadlessSolver:
         meta: ChallengeMeta,
         platform: CompetitionPlatform,
         cost_tracker: CostTracker,
-        settings: object,
+        settings: Settings,
         cancel_event: asyncio.Event | None = None,
-        submit_fn: Callable[[str], Awaitable[tuple[str, bool]]] | None = None,
+        submit_fn: SubmitFn | None = None,
         message_bus=None,
         notify_coordinator: Callable[[str], Awaitable[None]] | None = None,
-        resume_context: str = "",
         allow_exec: bool = True,
         time_budget_seconds: int = TASK_TIME_BUDGET_SECONDS,
         workdir: str = "",
@@ -364,18 +356,15 @@ class HeadlessSolver:
         self.cost_tracker = cost_tracker
         self.settings = settings
         self.cancel_event = cancel_event or asyncio.Event()
-        self.resume_context = resume_context
         self.allow_exec = allow_exec
         self.time_budget_seconds = time_budget_seconds
         self.no_submit = no_submit
 
-        self.use_vision = supports_vision(model_spec)
         parsed_hosts = _parse_allowed_hosts(meta.connection_info)
         self.deps = HeadlessDeps(
             platform=platform,
             challenge_name=meta.name,
             meta=meta,
-            use_vision=self.use_vision,
             cost_tracker=cost_tracker,
             submit_fn=submit_fn,
             message_bus=message_bus,
@@ -388,7 +377,6 @@ class HeadlessSolver:
             flags_accepted=meta.correct_flag_count,
             deadline_monotonic=time.monotonic() + time_budget_seconds,
             allowed_hosts=parsed_hosts,
-            scenario=_guess_scenario(meta),
         )
         self.loop_detector = LoopDetector()
         self.tracer = SolverTracer(meta.name, self.model_id)
@@ -401,6 +389,11 @@ class HeadlessSolver:
         self._confirmed: bool = False
         self._findings: str = ""
         self._usage_traced: bool = False
+
+    @property
+    def step_count(self) -> int:
+        """Current step count (tool calls made) for status reporting."""
+        return self._step_count[0]
         self._traced_input_tokens: int = 0
         self._traced_output_tokens: int = 0
         self._traced_cache_tokens: int = 0
@@ -438,8 +431,6 @@ class HeadlessSolver:
                 "report the missing target via notify_coordinator. run_python still "
                 "works for local computation."
             )
-        if self.resume_context:
-            system_prompt += "\n\n" + self.resume_context
 
         model = resolve_model(self.model_spec, self.settings)
         model_settings = resolve_model_settings(self.model_spec)
@@ -604,7 +595,6 @@ class HeadlessSolver:
         self.tracer.tool_result("submit_flag", display, step)
         if confirmed:
             self.deps.confirmed_flag = candidate
-            self.deps.last_progress_step = step
             self._confirmed = True
             self.tracer.event("flag_confirmed", tool="submit_flag", flag=candidate, step=step)
         else:

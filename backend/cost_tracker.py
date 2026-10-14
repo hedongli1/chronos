@@ -11,11 +11,14 @@ from pydantic_ai.usage import RunUsage
 
 logger = logging.getLogger(__name__)
 
-# Provider ID mapping for genai-prices
-PROVIDER_MAP: dict[str, str] = {
+# Provider ID mapping for genai-prices. Only ids present in genai-prices'
+# ProviderID registry are valid — 'alibaba'/'zhipu' are NOT, so qwen/glm lookups
+# used to fail and silently fall back to hardcoded pricing. Unknown providers
+# map to None, which lets calc_price match by model name and only then fall back.
+PROVIDER_MAP: dict[str, str | None] = {
     "deepseek": "deepseek",
-    "qwen": "alibaba",
-    "glm": "zhipu",
+    "qwen": None,
+    "glm": None,
 }
 
 # Fallback pricing for models not in genai-prices (per 1M tokens, USD)
@@ -63,7 +66,7 @@ def calc_cost(usage: RunUsage, model_name: str, provider_spec: str = "") -> floa
     if not usage.has_values():
         return 0.0
 
-    provider_id = PROVIDER_MAP.get(provider_spec, "unknown")
+    provider_id = PROVIDER_MAP.get(provider_spec)
 
     try:
         price = calc_price(usage, model_name, provider_id=provider_id)

@@ -4,7 +4,8 @@ The prompt is a neutral task contract: objective, tool contract, submission
 format, and hard constraints. It encodes NO attack methodology, no per-scenario
 playbook, and no "first do X then Y" procedure — the model's own reasoning
 decides how to search. (`_guess_scenario` survives only to pick a per-challenge
-time budget and to gate the target lock, never to shape the prompt text.)
+time budget — killchain tasks get longer. It never shapes the prompt text and
+never affects the target lock, which is purely structural.)
 """
 
 from __future__ import annotations
@@ -164,6 +165,7 @@ def build_headless_prompt(
         "- `check_findings()` / `notify_coordinator(msg)`: read sibling findings / report upward.",
         "",
         "## Constraints",
+        "- Flags on this platform look like `flag{...}` (or `CTF{...}`) — submit the token verbatim.",
         "- Submit flags verbatim as observed in THIS task's target output. Never guess, fabricate,",
         "  or derive a flag from the title/description.",
         "- The local disk is shared and untrusted: a flag found in a local file may belong to a",

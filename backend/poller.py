@@ -146,6 +146,11 @@ class PlatformPoller:
             if self._known_challenges and len(current_names) < len(self._known_challenges) // 2:
                 logger.warning(f"Poll returned suspicious data ({len(current_names)} challenges vs {len(self._known_challenges)} known) — skipping")
                 return
+            # Single known challenge: any drop to zero is suspicious (a stale
+            # [] answer would otherwise be accepted as "the run is over").
+            if self._known_challenges and not current_names:
+                logger.warning("Poll returned 0 challenges (had %d) — skipping", len(self._known_challenges))
+                return
             # Don't let solved count regress (API might return empty on errors)
             if self._known_solved and not current_solved:
                 logger.warning("Poll returned 0 solved (had %d) — skipping", len(self._known_solved))

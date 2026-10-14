@@ -21,7 +21,6 @@ def _deps(allowed: frozenset[str] | None = None) -> HeadlessDeps:
         platform=None,  # type: ignore[arg-type]
         challenge_name="test",
         meta=None,  # type: ignore[arg-type]
-        use_vision=False,
         allowed_hosts=allowed if allowed is not None else frozenset({"10.0.0.5"}),
     )
 

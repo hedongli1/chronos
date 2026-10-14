@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import atexit
 import json
+import re
 import time
 from pathlib import Path
 
 
 def _sanitize(s: str) -> str:
-    return s.replace("/", "_").replace(" ", "_")
+    # Path-safe on both POSIX and Windows: strip path separators, spaces and
+    # every character hostile to Windows filenames (<>:"|?* and control chars).
+    out = re.sub(r'[<>:"/\\|?*\x00-\x1f\s]+', "_", s).strip("_")
+    return out or "unknown"
 
 
 class SolverTracer:
@@ -40,7 +44,12 @@ class SolverTracer:
             pass
 
     def tool_call(self, tool_name: str, args: dict | str, step: int) -> None:
-        args_str = args if isinstance(args, str) else json.dumps(args)
+        # Serialize inside the guard: a non-serializable arg must degrade to a
+        # best-effort repr, never crash the solver's tracing path.
+        try:
+            args_str = args if isinstance(args, str) else json.dumps(args, default=repr)
+        except Exception:
+            args_str = repr(args)
         self._write({"type": "tool_call", "tool": tool_name, "args": args_str[:2000], "step": step})
 
     def tool_result(self, tool_name: str, result: str, step: int) -> None:

@@ -104,9 +104,9 @@ async def _check_benchmark_task(settings: Settings) -> bool:
 @click.option("--model-smoke-test", is_flag=True, help="Run a read-only LLM API connectivity smoke test")
 @click.option(
     "--max-challenges",
-    default=3,
+    default=None,
     type=click.IntRange(min=1, max=3),
-    help="Concurrent range-container window (hard cap 3)",
+    help="Concurrent range-container window (hard cap 3; default: .env / 3)",
 )
 @click.option("-i", "--interactive", is_flag=True, help="Enable interactive REPL (type messages in terminal)")
 @click.option("--web", is_flag=True, help="Launch the web console (live visualization + operator control + solver watch/talk)")
@@ -128,7 +128,7 @@ def main(
     no_submit: bool,
     smoke_test: bool,
     model_smoke_test: bool,
-    max_challenges: int,
+    max_challenges: int | None,
     interactive: bool,
     web: bool,
     web_host: str,
@@ -150,13 +150,21 @@ def main(
     if platform_token:
         settings.platform_token = platform_token
     if benchmark_base_url:
+        # The platform adapter prefers platform_url, whose default would
+        # shadow an explicit --benchmark-base-url. Keep both in sync so the
+        # CLI flag always wins (same for the token).
         settings.benchmark_url = benchmark_base_url
+        settings.platform_url = benchmark_base_url
     if benchmark_token:
         settings.benchmark_token = benchmark_token
+        settings.platform_token = benchmark_token
     if benchmark_name:
         settings.benchmark_name = benchmark_name
-    settings.max_concurrent_challenges = max_challenges
-    settings.platform_mode = "tsec"
+    if max_challenges is not None:
+        # Only override when the operator actually passed the flag — the
+        # .env value (MAX_CONCURRENT_CHALLENGES) must not be clobbered by
+        # the option's default.
+        settings.max_concurrent_challenges = max_challenges
 
     if time_limit is not None:
         settings.challenge_time_limit_seconds = time_limit
@@ -184,7 +192,7 @@ def main(
     console.print("  Executor: headless (no sandbox; http/tcp/run_python tools)")
     if not settings.allow_local_exec:
         console.print("  Local exec: disabled (--no-exec)")
-    console.print(f"  Max challenges: {max_challenges}")
+    console.print(f"  Max challenges: {settings.max_concurrent_challenges}")
     console.print(f"  Per-challenge time limit: {settings.challenge_time_limit_seconds}s")
     if settings.total_benchmark_budget_seconds > 0:
         console.print(
@@ -248,7 +256,7 @@ async def _run_single(
     challenge_ref: str,
     model_specs: list[str],
     no_submit: bool,
-    max_challenges: int,
+    max_challenges: int | None,
     challenges_dir: str = "challenges",
 ) -> None:
     """Run a single challenge with a swarm."""
@@ -439,8 +447,10 @@ async def _run_model_smoke_test(settings: Settings, model_specs: list[str]) -> N
     ok = sum(1 for _, v in results if v.startswith("ok:"))
     console.print()
     console.print(f"[bold]模型自检结果: {ok}/{len(results)} 通过[/bold]")
-    if ok == len(results):
+    if results and ok == len(results):
         console.print("[bold green]大模型 API Key 可正常调用。[/bold green]")
+    elif not results:
+        console.print("[bold red]没有可测试的模型 — 至少配置一个 API Key（或传入 --models）。[/bold red]")
     else:
         console.print("[bold yellow]至少有一个模型 API 调用失败，请检查 Key 或模型配置。[/bold yellow]")
 

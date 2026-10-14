@@ -48,33 +48,17 @@ REPORT_PATH = "logs/analysis-report.md"
 TIME_LIMIT_S = 1800
 KILLCHAIN_TIME_LIMIT_S = 2700
 
-# Scenario classifier copied from backend/prompts.py::_guess_scenario
-# (kept in sync manually; metadata `category` holds difficulty, not scenario).
-_SCENARIO_WORDS = (
-    ("渗透", "killchain"), ("横向", "killchain"), ("内网", "killchain"),
-    ("kill chain", "killchain"), ("穿透", "killchain"), ("多级", "killchain"),
-    ("跳板", "killchain"),
-    ("免杀", "evasion"), ("绕过", "evasion"), ("规避", "evasion"),
-    ("waf", "evasion"), ("edr", "evasion"),
-    ("rce", "exploit"), ("poc", "exploit"), ("利用", "exploit"), ("exp_", "exploit"),
-    ("k8s", "cloud"), ("kubernetes", "cloud"), ("容器逃逸", "cloud"),
-    ("iam", "cloud"), ("云", "cloud"),
-    ("pwn", "binary"), ("reverse", "binary"), ("逆向", "binary"),
-    ("二进制", "binary"), ("stack", "binary"), ("heap", "binary"),
-    ("overflow", "binary"), ("bof", "binary"),
-    ("注入", "web"), ("sql", "web"), ("xss", "web"),
-)
-
 
 def guess_scenario(meta: dict) -> str:
-    blob = " ".join(str(meta.get(k, "")) for k in ("unique_code", "name", "category", "description")).lower()
-    for key in ("killchain", "evasion", "exploit", "cloud", "binary", "web"):
-        if key in blob:
-            return key
-    for word, key in _SCENARIO_WORDS:
-        if word in blob:
-            return key
-    return "web"
+    """Scenario classifier — single source of truth lives in backend.prompts.
+
+    Imported at call time so the analyzer can never drift from the solver's
+    own classification again (it used to keep a manual copy that lagged).
+    """
+    from backend.prompts import ChallengeMeta, _guess_scenario
+
+    return _guess_scenario(ChallengeMeta(**{k: v for k, v in meta.items()
+                                            if k in ChallengeMeta.__dataclass_fields__}))
 
 
 # Tool-result error signatures, based on backend/tools/*.py return strings.
