@@ -47,8 +47,13 @@ class HeadlessDeps:
     # Flags the platform actively rejected this run — never resubmit these.
     rejected_flags: list[str] = field(default_factory=list)
     # Target lock: hosts parsed from the task's connection_info. The solver's
-    # own egress is always restricted to these (empty = degraded, localhost
-    # only). There is no bypass — purely structural.
+    # own egress is restricted to these (empty = degraded, localhost only).
+    # This is a STRUCTURAL guard against accidental drift onto a non-assigned
+    # host — not a hardened sandbox: run_python installs it via in-process
+    # socket patches in an isolated namespace (see tools/local_exec.py), which
+    # stops normal/accidental bypasses but not a deliberately adversarial
+    # snippet. http_request/tcp_send enforce it at the tool entry + per redirect
+    # hop, which those paths cannot bypass.
     allowed_hosts: frozenset[str] = frozenset()
 
 

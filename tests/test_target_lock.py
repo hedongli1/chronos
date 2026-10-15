@@ -13,6 +13,7 @@ from backend.agents.headless_solver import (
     _target_lock_block,
 )
 from backend.deps import HeadlessDeps
+from backend.tools.local_exec import do_run_python
 from backend.tools.net_tools import do_raw_http
 
 
@@ -172,3 +173,100 @@ class TestDoRawHttpRedirectLock:
         out = await do_raw_http("http://example.com/")
         assert "hello" in out
         assert called == ["http://example.com/"]
+
+
+class TestRunPythonNamespaceIsolation:
+    """The run_python target-lock preamble must not leak its internals into the
+    snippet's namespace. Regression for the confirmed sandbox-escape: the saved
+    originals / guard / allowed-set used to be module globals reachable by model
+    code (`_orig_connect(...)`, `guard = lambda…`), a trivial bypass.
+
+    These run real local subprocesses (sys.executable -I). No network is touched:
+    the guard raises PermissionError BEFORE any connect, and the introspection
+    snippets only read globals().
+    """
+
+    _ALLOWED = frozenset({"10.0.0.5"})
+
+    async def test_preamble_internals_absent_from_globals(self) -> None:
+        out = await do_run_python(
+            "import json; print(json.dumps(sorted(globals())))",
+            allowed_hosts=self._ALLOWED,
+        )
+        # None of the guard internals may be visible to the snippet.
+        for leaked in (
+            "_orig_connect", "orig_connect", "_guard", "guard",
+            "_ALLOWED_HOSTS", "allowed", "_spawn_error", "spawn_error",
+            "_chronos_target_lock", "_orig_popen", "orig_popen",
+        ):
+            assert f'"{leaked}"' not in out, f"preamble internal {leaked!r} leaked into globals"
+
+    async def test_guard_blocks_disallowed_host(self) -> None:
+        out = await do_run_python(
+            "import socket\n"
+            "s = socket.socket()\n"
+            "try:\n"
+            "    s.connect(('10.0.9.9', 80))\n"
+            "    print('CONNECTED')\n"
+            "except PermissionError as e:\n"
+            "    print('BLOCKED:', e)\n",
+            allowed_hosts=self._ALLOWED,
+        )
+        assert "BLOCKED" in out and "CONNECTED" not in out
+
+    async def test_reassigning_global_guard_does_not_disable_lock(self) -> None:
+        """A snippet defining its own global `guard` must NOT neuter the real
+        closure guard the patched socket methods use."""
+        out = await do_run_python(
+            "guard = lambda a: None\n"
+            "allowed = frozenset({'10.0.9.9'})\n"
+            "import socket\n"
+            "s = socket.socket()\n"
+            "try:\n"
+            "    s.connect(('10.0.9.9', 80))\n"
+            "    print('CONNECTED')\n"
+            "except PermissionError as e:\n"
+            "    print('BLOCKED:', e)\n",
+            allowed_hosts=self._ALLOWED,
+        )
+        assert "BLOCKED" in out and "CONNECTED" not in out
+
+    async def test_subprocess_still_blocked(self) -> None:
+        out = await do_run_python(
+            "import subprocess\n"
+            "try:\n"
+            "    subprocess.Popen(['echo', 'hi'])\n"
+            "    print('SPAWNED')\n"
+            "except PermissionError as e:\n"
+            "    print('BLOCKED:', e)\n",
+            allowed_hosts=self._ALLOWED,
+        )
+        assert "BLOCKED" in out and "SPAWNED" not in out
+
+    async def test_snippet_cannot_reenable_subprocess_via_env(self) -> None:
+        """The opt-out is captured at install time: a snippet flipping
+        RUN_PYTHON_ALLOW_SUBPROCESS in os.environ must NOT unlock spawning."""
+        out = await do_run_python(
+            "import os, subprocess\n"
+            "os.environ['RUN_PYTHON_ALLOW_SUBPROCESS'] = '1'\n"
+            "try:\n"
+            "    subprocess.Popen(['echo', 'hi'])\n"
+            "    print('SPAWNED')\n"
+            "except PermissionError as e:\n"
+            "    print('BLOCKED:', e)\n",
+            allowed_hosts=self._ALLOWED,
+        )
+        assert "BLOCKED" in out and "SPAWNED" not in out
+
+    async def test_local_computation_still_works(self) -> None:
+        """The isolation must not break ordinary in-process computation."""
+        out = await do_run_python(
+            "print(sum(range(10)))",
+            allowed_hosts=self._ALLOWED,
+        )
+        assert "45" in out
+
+    async def test_no_allowlist_runs_unpatched(self) -> None:
+        """allowed_hosts=None means no preamble at all (backward compat)."""
+        out = await do_run_python("print('plain')", allowed_hosts=None)
+        assert "plain" in out

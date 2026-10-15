@@ -132,14 +132,24 @@ class TestR6Regressions:
 
     def test_run_python_preamble_is_windows_safe(self) -> None:
         """sendmsg is Unix-only: the generated guard must not reference it
-        unconditionally, and _os must survive for _spawn_error."""
+        unconditionally; the subprocess opt-out must read os.environ at call
+        time; and the guard must be installed from an isolated namespace."""
         import inspect
 
         from backend.tools import local_exec
 
         src = inspect.getsource(local_exec.do_run_python)
         # the preamble lives inside do_run_python's body as string literals
-        assert "hasattr(_socket.socket, 'sendmsg')" in src
-        assert "del _os" not in src
+        # sendmsg patch is hasattr-guarded (Unix-only) → Windows-safe
+        assert "hasattr(socket.socket, 'sendmsg')" in src
+        # the whole guard is installed from a function so its internals are
+        # closure locals, never module globals reachable by the snippet
+        assert "def _chronos_target_lock():" in src
+        assert "del _chronos_target_lock" in src
+        # spawn_error reads os.environ at call time (the opt-out flag is threaded
+        # as an env var); `os` is a closure local that survives via the patched
+        # functions' closures — it must NOT be deleted at module level
+        assert "os.environ.get('RUN_PYTHON_ALLOW_SUBPROCESS')" in src
+        assert "del _os" not in src and "\n    del os" not in src
         # taskkill must not run synchronously in the async path
         assert "subprocess.run(" not in src or "taskkill" not in src
