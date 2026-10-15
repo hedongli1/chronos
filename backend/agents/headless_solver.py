@@ -37,7 +37,14 @@ from backend.prompts import (
     ChallengeMeta,
     build_headless_prompt,
 )
-from backend.solver_base import CANCELLED, ERROR, FLAG_FOUND, GAVE_UP, SolverResult
+from backend.solver_base import (
+    CANCELLED,
+    ERROR,
+    FLAG_FOUND,
+    GAVE_UP,
+    SolverResult,
+    terminal_reason_for,
+)
 from backend.tools.local_exec import do_run_python
 from backend.tools.net_tools import do_raw_http, do_tcp_send
 from backend.tracing import SolverTracer
@@ -318,6 +325,19 @@ def _build_toolset(
         from backend.tools.core import do_check_findings
 
         return await do_check_findings(ctx.deps.message_bus, ctx.deps.model_spec)
+
+    @toolset.tool
+    async def search_findings(ctx: RunContext[HeadlessDeps], query: str) -> str:
+        """Keyword-search findings sibling solvers posted on THIS task.
+
+        Unlike check_findings (which returns only the unread backlog once), this
+        is repeatable and searches the whole shared log — use it to pull back a
+        specific endpoint, credential, parameter, or error string a sibling
+        mentioned earlier. All terms must appear (case-insensitive). Results are
+        unverified self-reports: verify before relying on them."""
+        from backend.tools.core import do_search_findings
+
+        return await do_search_findings(ctx.deps.message_bus, ctx.deps.model_spec, query)
 
     @toolset.tool
     async def notify_coordinator(ctx: RunContext[HeadlessDeps], message: str) -> str:
@@ -739,6 +759,8 @@ class HeadlessSolver:
             "confirmed": self._confirmed,
             "cost_usd": round(cost, 4),
         }
+        terminal_reason = terminal_reason_for(status, cancel_reason)
+        finish["terminal_reason"] = terminal_reason
         if cancel_reason:
             finish["cancel_reason"] = cancel_reason
         self.tracer.event("finish", **finish)
@@ -749,6 +771,7 @@ class HeadlessSolver:
             step_count=self._step_count[0],
             cost_usd=cost,
             log_path=self.tracer.path,
+            terminal_reason=terminal_reason,
         )
 
     async def stop(self) -> None:

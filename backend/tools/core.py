@@ -31,3 +31,21 @@ async def do_check_findings(message_bus, model_spec: str) -> str:
     if not findings:
         return "No new findings from other agents."
     return message_bus.format_unread(findings)
+
+
+async def do_search_findings(message_bus, model_spec: str, query: str) -> str:
+    """Keyword-search ALL sibling findings on this task (repeatable, on-demand).
+
+    Complements do_check_findings: check returns only the unread backlog once
+    and advances the cursor; search never touches cursors, so a solver can
+    re-query a specific term (an endpoint, a credential, an error string) at
+    any point. Pure homogeneous-worker knowledge sharing — no role split.
+    """
+    if not message_bus:
+        return "No message bus available."
+    if not (query or "").strip():
+        return "search_findings: empty query."
+    matches = await message_bus.search(query, model_spec)
+    if not matches:
+        return f"No sibling findings match {query!r}."
+    return message_bus.format_search(matches, query.strip())

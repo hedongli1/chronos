@@ -164,7 +164,10 @@ def build_headless_prompt(
         "- `request_hint()`: fetch the platform hint for this task. It DEDUCTS score and is "
         "limited to once per task — use it only when your own ideas are exhausted.",
         "- `task_status()`: accepted/total flag count and remaining time.",
-        "- `check_findings()` / `notify_coordinator(msg)`: read sibling findings / report upward.",
+        "- `check_findings()`: read the unread backlog of sibling findings (once).",
+        "- `search_findings(query)`: re-query ALL sibling findings by keyword, repeatable —",
+        "  use it to pull back a specific endpoint/credential/error a sibling mentioned.",
+        "- `notify_coordinator(msg)`: report a strategic discovery or help request upward.",
         "",
     ]
     if extra_tools:
